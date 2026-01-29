@@ -1,0 +1,176 @@
+# Example configuration file for LPMOS
+# In production, use environment variables or a proper config management system
+
+# Control Plane Configuration
+control_plane:
+  api:
+    port: 8080
+    host: "0.0.0.0"
+    tls:
+      enabled: false
+      cert_file: "/etc/lpmos/certs/server.crt"
+      key_file: "/etc/lpmos/certs/server.key"
+
+  etcd:
+    endpoints:
+      - "localhost:2379"
+      - "etcd-2:2379"
+      - "etcd-3:2379"
+    dial_timeout: "5s"
+    request_timeout: "10s"
+    tls:
+      enabled: false
+      ca_file: "/etc/lpmos/certs/ca.crt"
+      cert_file: "/etc/lpmos/certs/client.crt"
+      key_file: "/etc/lpmos/certs/client.key"
+
+  auth:
+    enabled: false
+    jwt_secret: "change-me-in-production"
+    token_expiry: "24h"
+
+  notifications:
+    webhook_url: "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+    email:
+      enabled: false
+      smtp_host: "smtp.example.com"
+      smtp_port: 587
+      from: "lpmos@example.com"
+      to:
+        - "admin@example.com"
+
+# Regional Client Configuration
+regional_client:
+  region_id: "dc1"
+
+  api:
+    port: 8081
+    host: "0.0.0.0"
+
+  etcd:
+    endpoints:
+      - "localhost:2379"
+    dial_timeout: "5s"
+    request_timeout: "10s"
+
+  services:
+    pxe:
+      enabled: true
+      interface: "eth0"
+      dhcp_range_start: "192.168.1.100"
+      dhcp_range_end: "192.168.1.200"
+      gateway: "192.168.1.1"
+      dns_servers:
+        - "8.8.8.8"
+        - "8.8.4.4"
+
+    tftp:
+      enabled: true
+      port: 69
+      root_dir: "/var/lib/lpmos/tftp"
+
+    http:
+      enabled: true
+      port: 80
+      root_dir: "/var/lib/lpmos/http"
+
+  installation:
+    timeout: "3600s"  # 1 hour
+    retry_attempts: 3
+    os_images:
+      ubuntu_22_04:
+        url: "http://archive.ubuntu.com/ubuntu/dists/jammy/main/installer-amd64/"
+        checksum: "sha256:..."
+      centos_8:
+        url: "http://mirror.centos.org/centos/8-stream/BaseOS/x86_64/os/"
+        checksum: "sha256:..."
+
+# Agent Configuration
+agent:
+  regional_client_url: "http://regional-client:8081"
+
+  collection:
+    timeout: "60s"
+    retry_attempts: 3
+    retry_delay: "5s"
+
+  hardware:
+    collect_bios: true
+    collect_dmidecode: true
+    collect_network_speed: true
+
+  reporting:
+    interval: "30s"
+    batch_size: 1
+
+# Logging Configuration
+logging:
+  level: "info"  # debug, info, warn, error
+  format: "json"  # json, text
+  output: "stdout"  # stdout, file
+  file:
+    path: "/var/log/lpmos/lpmos.log"
+    max_size: 100  # MB
+    max_backups: 10
+    max_age: 30  # days
+
+# Monitoring Configuration
+monitoring:
+  enabled: false
+  prometheus:
+    port: 9090
+    path: "/metrics"
+
+  health_check:
+    interval: "30s"
+    timeout: "5s"
+
+  tracing:
+    enabled: false
+    jaeger_endpoint: "http://jaeger:14268/api/traces"
+
+# Security Configuration
+security:
+  api_keys:
+    enabled: false
+    keys:
+      - name: "admin"
+        key: "admin-key-change-me"
+        permissions: ["read", "write", "approve"]
+      - name: "readonly"
+        key: "readonly-key-change-me"
+        permissions: ["read"]
+
+  agent_authentication:
+    enabled: false
+    token_rotation: true
+    token_ttl: "1h"
+
+  rate_limiting:
+    enabled: false
+    requests_per_minute: 100
+    burst: 20
+
+# Feature Flags
+features:
+  auto_approval:
+    enabled: false
+    rules:
+      - name: "trusted_vendor"
+        condition: "hardware.bios.vendor == 'Dell Inc.'"
+        action: "approve"
+      - name: "min_memory"
+        condition: "hardware.memory.total_gb >= 128"
+        action: "approve"
+
+  multi_os_support:
+    enabled: true
+    supported_os:
+      - "ubuntu"
+      - "centos"
+      - "rocky"
+      - "debian"
+
+  post_install_automation:
+    enabled: false
+    ansible_playbook: "/etc/lpmos/playbooks/post-install.yml"
