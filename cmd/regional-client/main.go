@@ -290,6 +290,66 @@ func (c *RegionalClient) startAPIServer(port string) {
 		ctx.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
+	// Agent progress update endpoint
+	router.POST("/api/v1/agent/progress", func(ctx *gin.Context) {
+		var req models.AgentProgressRequest
+		if err := ctx.ShouldBindJSON(&req); err != nil {
+			ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		log.Printf("[%s] Agent progress for task %s: [%d%%] %s - %s",
+			c.regionID, req.TaskID, req.Percentage, req.Stage, req.Message)
+
+		// Store progress in etcd
+		progress := models.Progress{
+			TaskID:     req.TaskID,
+			Stage:      req.Stage,
+			Percentage: req.Percentage,
+			Message:    req.Message,
+			Details:    req.Details,
+			UpdatedAt:  time.Now(),
+		}
+
+		if err := c.etcdClient.Put(etcd.TaskKey(req.TaskID, "progress"), progress); err != nil {
+			log.Printf("Failed to store progress: %v", err)
+			ctx.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store progress"})
+			return
+		}
+
+		// Update task status based on stage
+		if req.Stage == "partitioning" || req.Stage == "downloading" ||
+			req.Stage == "installing" || req.Stage == "configuring" {
+			c.etcdClient.Put(etcd.TaskKey(req.TaskID, "status"), string(models.TaskStatusInstalling))
+		}
+
+		ctx.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
+
+	// Agent approval check endpoint
+	router.GET("/api/v1/agent/approval/:mac", func(ctx *gin.Context) {
+		macAddr := ctx.Param("mac")
+
+		// Find task by MAC address
+		taskID, err := c.findTaskByMAC(macAddr)
+		if err != nil {
+			ctx.JSON(http.StatusNotFound, gin.H{"approved": false})
+			return
+		}
+
+		// Check approval status
+		var approval models.Approval
+		if err := c.etcdClient.GetJSON(etcd.TaskKey(taskID, "approval"), &approval); err != nil {
+			ctx.JSON(http.StatusOK, gin.H{"approved": false, "task_id": taskID})
+			return
+		}
+
+		ctx.JSON(http.StatusOK, gin.H{
+			"approved": approval.Status == models.ApprovalStatusApproved,
+			"task_id":  taskID,
+		})
+	})
+
 	// Health check
 	router.GET("/api/v1/health", func(ctx *gin.Context) {
 		ctx.JSON(http.StatusOK, gin.H{

@@ -111,11 +111,31 @@ type Approval struct {
 
 // TaskError represents error information
 type TaskError struct {
-	Code      string    `json:"code"`
-	Message   string    `json:"message"`
-	Details   string    `json:"details,omitempty"`
+	Code       string    `json:"code"`
+	Message    string    `json:"message"`
+	Details    string    `json:"details,omitempty"`
 	OccurredAt time.Time `json:"occurred_at"`
 }
+
+// Progress represents installation progress information
+type Progress struct {
+	TaskID     string                 `json:"task_id"`
+	Stage      string                 `json:"stage"` // partitioning, downloading, installing, configuring
+	Percentage int                    `json:"percentage"`
+	Message    string                 `json:"message"`
+	Details    map[string]interface{} `json:"details,omitempty"`
+	UpdatedAt  time.Time              `json:"updated_at"`
+}
+
+// InstallStage represents different stages of installation
+type InstallStage string
+
+const (
+	StagePartitioning InstallStage = "partitioning"
+	StageDownloading  InstallStage = "downloading"
+	StageInstalling   InstallStage = "installing"
+	StageConfiguring  InstallStage = "configuring"
+)
 
 // CreateTaskRequest represents the request to create a task
 type CreateTaskRequest struct {
@@ -148,6 +168,31 @@ type AgentStatusRequest struct {
 	Status     string `json:"status" binding:"required"`
 	Progress   int    `json:"progress"`
 	Message    string `json:"message"`
+}
+
+// AgentProgressRequest represents progress update from agent
+type AgentProgressRequest struct {
+	MACAddress string                 `json:"mac_address" binding:"required"`
+	TaskID     string                 `json:"task_id" binding:"required"`
+	Stage      string                 `json:"stage" binding:"required"`
+	Percentage int                    `json:"percentage" binding:"required"`
+	Message    string                 `json:"message"`
+	Details    map[string]interface{} `json:"details,omitempty"`
+}
+
+// WebSocketMessage represents a message sent via WebSocket
+type WebSocketMessage struct {
+	Type    string      `json:"type"` // progress, status, hardware
+	TaskID  string      `json:"task_id,omitempty"`
+	Payload interface{} `json:"payload,omitempty"`
+	// For progress type
+	Percentage int    `json:"percentage,omitempty"`
+	Stage      string `json:"stage,omitempty"`
+	Message    string `json:"message,omitempty"`
+	// For status type
+	Status string `json:"status,omitempty"`
+	// For hardware type
+	Hardware *HardwareInfo `json:"hardware,omitempty"`
 }
 
 // RegionalClientHeartbeat represents health information
