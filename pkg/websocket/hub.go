@@ -3,6 +3,7 @@ package websocket
 import (
 	"encoding/json"
 	"log"
+	"net/http"
 	"sync"
 	"time"
 
@@ -191,4 +192,30 @@ func (c *Client) WritePump() {
 			}
 		}
 	}
+}
+
+// ServeWs handles WebSocket upgrade requests
+func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true // Allow all origins in development
+		},
+	}
+
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("WebSocket upgrade error: %v", err)
+		return
+	}
+
+	client := &Client{
+		Hub:  hub,
+		Conn: conn,
+		Send: make(chan []byte, 256),
+	}
+
+	client.Hub.Register <- client
+
+	go client.WritePump()
+	go client.ReadPump()
 }

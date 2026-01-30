@@ -10,11 +10,15 @@ import (
 )
 
 const (
-	// Key prefixes
-	KeyPrefixTasks   = "/lpmos/tasks/"
-	KeyPrefixRegions = "/lpmos/regions/"
-	KeyPrefixAgents  = "/lpmos/agents/"
-	KeyPrefixConfig  = "/lpmos/config/"
+	// Key prefixes (updated for region-based structure)
+	KeyPrefixTasks          = "/os/install/task/"
+	KeyPrefixRegions        = "/os/region/"
+	KeyPrefixUnmatchedReports = "/os/unmatched_reports/"
+
+	// OPTIMIZED SCHEMA v3.0 key prefixes
+	KeyPrefixServers        = "/os/%s/servers/"          // Individual server keys
+	KeyPrefixMachines       = "/os/%s/machines//"         // Machine details
+	KeyPrefixGlobalStats    = "/os/global/stats/"        // Cross-IDC stats
 
 	// Default timeouts
 	DefaultDialTimeout    = 5 * time.Second
@@ -214,18 +218,119 @@ func (c *Client) Transaction(ops []clientv3.Op) error {
 	return nil
 }
 
+// GetWithVersion retrieves a value and its version (for CAS operations)
+func (c *Client) GetWithVersion(key string) ([]byte, int64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), c.requestTimeout)
+	defer cancel()
+
+	resp, err := c.cli.Get(ctx, key)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to get key %s: %w", key, err)
+	}
+
+	if len(resp.Kvs) == 0 {
+		return nil, 0, fmt.Errorf("key not found: %s", key)
+	}
+
+	return resp.Kvs[0].Value, resp.Kvs[0].Version, nil
+}
+
+// Txn creates a new transaction
+func (c *Client) Txn(ctx context.Context) clientv3.Txn {
+	return c.cli.Txn(ctx)
+}
+
+// AtomicUpdate performs an atomic read-modify-write with version check (v3.0)
+func (c *Client) AtomicUpdate(key string, updateFn func([]byte) (interface{}, error)) error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.requestTimeout)
+	defer cancel()
+
+	for retries := 0; retries < 3; retries++ {
+		// Get current version
+		data, version, err := c.GetWithVersion(key)
+		if err != nil {
+			return err
+		}
+
+		// Apply update function
+		newValue, err := updateFn(data)
+		if err != nil {
+			return err
+		}
+
+		// Marshal new value
+		var valueStr string
+		switch v := newValue.(type) {
+		case string:
+			valueStr = v
+		case []byte:
+			valueStr = string(v)
+		default:
+			jsonData, err := json.Marshal(newValue)
+			if err != nil {
+				return fmt.Errorf("failed to marshal value: %w", err)
+			}
+			valueStr = string(jsonData)
+		}
+
+		// Atomic compare-and-swap
+		txn := c.cli.Txn(ctx)
+		resp, err := txn.
+			If(clientv3.Compare(clientv3.Version(key), "=", version)).
+			Then(clientv3.OpPut(key, valueStr)).
+			Else(clientv3.OpGet(key)).
+			Commit()
+
+		if err != nil {
+			return fmt.Errorf("transaction failed: %w", err)
+		}
+
+		if resp.Succeeded {
+			return nil // Success!
+		}
+
+		// Conflict - retry
+		time.Sleep(time.Duration(retries+1) * 100 * time.Millisecond)
+	}
+
+	return fmt.Errorf("failed after 3 retries due to conflicts")
+}
+
+// GrantLease creates a new lease with keep-alive (v3.0)
+func (c *Client) GrantLease(ctx context.Context, ttlSeconds int64) (clientv3.LeaseID, <-chan *clientv3.LeaseKeepAliveResponse, error) {
+	lease, err := c.cli.Grant(ctx, ttlSeconds)
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to create lease: %w", err)
+	}
+
+	keepAliveChan, err := c.cli.KeepAlive(ctx, lease.ID)
+	if err != nil {
+		return 0, nil, fmt.Errorf("failed to keep-alive lease: %w", err)
+	}
+
+	return lease.ID, keepAliveChan, nil
+}
+
 // Helper functions for building keys
 
-// TaskKey builds a task key path
-func TaskKey(taskID string, suffix ...string) string {
-	key := KeyPrefixTasks + taskID
+// TaskKey builds a task key path with region
+// Example: TaskKey("dc1", "task-123", "status") -> "/os/install/task/dc1/task-123/status"
+func TaskKey(regionID string, taskID string, suffix ...string) string {
+	key := KeyPrefixTasks + regionID + "/" + taskID
 	for _, s := range suffix {
 		key += "/" + s
 	}
 	return key
 }
 
+// TaskKeyPrefix returns the prefix for all tasks in a region
+// Example: TaskKeyPrefix("dc1") -> "/os/install/task/dc1/"
+func TaskKeyPrefix(regionID string) string {
+	return KeyPrefixTasks + regionID + "/"
+}
+
 // RegionKey builds a region key path
+// Example: RegionKey("dc1", "heartbeat") -> "/os/region/dc1/heartbeat"
 func RegionKey(regionID string, suffix ...string) string {
 	key := KeyPrefixRegions + regionID
 	for _, s := range suffix {
@@ -234,9 +339,15 @@ func RegionKey(regionID string, suffix ...string) string {
 	return key
 }
 
-// AgentKey builds an agent key path
+// UnmatchedReportKey builds an unmatched report key
+// Example: UnmatchedReportKey("dc1", "20260130-fe:b7:02:c0:95:e0")
+func UnmatchedReportKey(regionID string, identifier string) string {
+	return KeyPrefixUnmatchedReports + regionID + "/" + identifier
+}
+
+// AgentKey builds an agent key path (deprecated, kept for compatibility)
 func AgentKey(macAddr string, suffix ...string) string {
-	key := KeyPrefixAgents + macAddr
+	key := "/os/agents/" + macAddr
 	for _, s := range suffix {
 		key += "/" + s
 	}
@@ -246,4 +357,54 @@ func AgentKey(macAddr string, suffix ...string) string {
 // IsKeyNotFound checks if error is key not found
 func IsKeyNotFound(err error) bool {
 	return err != nil && err.Error() == "key not found"
+}
+
+// OPTIMIZED SCHEMA v3.0 key helpers
+
+// ServerKey builds a server key path (v3.0 individual keys)
+// Example: ServerKey("dc1", "sn-001") -> "/os/dc1/servers/sn-001"
+func ServerKey(idc string, sn string) string {
+	return fmt.Sprintf("/os/%s/servers/%s", idc, sn)
+}
+
+// ServerPrefix returns the prefix for all servers in an IDC (v3.0)
+// Example: ServerPrefix("dc1") -> "/os/dc1/servers/"
+func ServerPrefix(idc string) string {
+	return fmt.Sprintf(KeyPrefixServers, idc)
+}
+
+// MachineKey builds a machine key path (v3.0)
+// Example: MachineKey("dc1", "sn-001", "meta") -> "/os/dc1/machines/sn-001/meta"
+func MachineKey(idc string, sn string, suffix string) string {
+	return fmt.Sprintf("/os/%s/machines/%s/%s", idc, sn, suffix)
+}
+
+// MachinePrefix returns the prefix for all machines in an IDC (v3.0)
+// Example: MachinePrefix("dc1") -> "/os/dc1/machines/"
+func MachinePrefix(idc string) string {
+	return fmt.Sprintf("/os/%s/machines/", idc)
+}
+
+// TaskKeyV3 builds the task key path (merged task + state) (v3.0)
+// Example: TaskKeyV3("dc1", "sn-001") -> "/os/dc1/machines/sn-001/task"
+func TaskKeyV3(idc string, sn string) string {
+	return MachineKey(idc, sn, "task")
+}
+
+// MetaKey builds the hardware metadata key path (v3.0)
+// Example: MetaKey("dc1", "sn-001") -> "/os/dc1/machines/sn-001/meta"
+func MetaKey(idc string, sn string) string {
+	return MachineKey(idc, sn, "meta")
+}
+
+// LeaseKey builds the lease key path for heartbeats (v3.0)
+// Example: LeaseKey("dc1", "sn-001") -> "/os/dc1/machines/sn-001/lease"
+func LeaseKey(idc string, sn string) string {
+	return MachineKey(idc, sn, "lease")
+}
+
+// StatsKey builds the stats key path (v3.0)
+// Example: StatsKey("dc1") -> "/os/global/stats/dc1"
+func StatsKey(idc string) string {
+	return fmt.Sprintf("%s%s", KeyPrefixGlobalStats, idc)
 }

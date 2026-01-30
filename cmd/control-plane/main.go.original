@@ -1,0 +1,761 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/lpmos/lpmos-go/pkg/etcd"
+	"github.com/lpmos/lpmos-go/pkg/models"
+	"github.com/lpmos/lpmos-go/pkg/websocket"
+)
+
+// ControlPlane manages the central control plane for LPMOS v3.0
+type ControlPlane struct {
+	etcdClient *etcd.Client
+	wsHub      *websocket.Hub
+	ctx        context.Context
+	cancel     context.CancelFunc
+}
+
+func main() {
+	log.Println("Starting LPMOS Control Plane v3.0...")
+
+	// Initialize etcd client
+	etcdClient, err := etcd.NewClient(etcd.Config{
+		Endpoints:      []string{"localhost:2379"},
+		DialTimeout:    5 * time.Second,
+		RequestTimeout: 10 * time.Second,
+	})
+	if err != nil {
+		log.Fatalf("Failed to connect to etcd: %v", err)
+	}
+	defer etcdClient.Close() // Release etcd connection when done
+
+	// Initialize WebSocket hub
+	wsHub := websocket.NewHub()
+	go wsHub.Run()
+
+	// Create control plane
+	ctx, cancel := context.WithCancel(context.Background())
+	cp := &ControlPlane{
+		etcdClient: etcdClient,
+		wsHub:      wsHub,
+		ctx:        ctx,
+		cancel:     cancel,
+	}
+
+	// Start watchers
+	go cp.watchTasks()
+	go cp.watchLeases()
+
+	// Setup HTTP server
+	router := setupRouter(cp)
+
+	// Start server
+	srv := &http.Server{
+		Addr:    ":8080",
+		Handler: router,
+	}
+
+	go func() {
+		log.Println("Control plane listening on :8080")
+		log.Println("Dashboard: http://localhost:8080")
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Failed to start server: %v", err)
+		}
+	}()
+
+	// Wait for interrupt signal
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	<-sigCh
+
+	log.Println("Shutting down control plane...")
+	cancel()
+	srv.Shutdown(context.Background())
+}
+
+func setupRouter(cp *ControlPlane) *gin.Engine {
+	gin.SetMode(gin.ReleaseMode)
+	router := gin.Default()
+
+	// WebSocket endpoint
+	router.GET("/ws", func(c *gin.Context) {
+		websocket.ServeWs(cp.wsHub, c.Writer, c.Request)
+	})
+
+	// API routes
+	api := router.Group("/api/v1")
+	{
+		api.POST("/tasks", cp.createTask)
+		api.GET("/tasks", cp.listTasks)
+		api.GET("/tasks/:idc/:sn", cp.getTask)
+		api.POST("/tasks/:idc/:sn/approve", cp.approveTask)
+		api.POST("/tasks/:idc/:sn/reject", cp.rejectTask)
+		api.GET("/servers/:idc", cp.listServers)
+		api.GET("/stats/:idc", cp.getStats)
+		api.GET("/stats", cp.getAllStats)
+	}
+
+	// Serve static files
+	router.GET("/", func(c *gin.Context) {
+		c.Header("Content-Type", "text/html")
+		c.String(http.StatusOK, dashboardHTML)
+	})
+
+	router.GET("/tasks/create", func(c *gin.Context) {
+		c.Header("Content-Type", "text/html")
+		c.String(http.StatusOK, addTaskHTML)
+	})
+
+	return router
+}
+
+// createTask creates a new installation task using OPTIMIZED SCHEMA v3.0
+func (cp *ControlPlane) createTask(c *gin.Context) {
+	var req models.CreateTaskRequestV3
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Step 1: Add to servers directory (INDIVIDUAL KEY)
+	serverKey := etcd.ServerKey(req.IDC, req.SN)
+	serverEntry := models.ServerEntry{
+		SN:      req.SN,
+		Status:  "pending",
+		MAC:     req.MAC,
+		AddedAt: time.Now(),
+	}
+
+	if err := cp.etcdClient.Put(serverKey, serverEntry); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to add server: %v", err)})
+		return
+	}
+
+	// Step 2: Initialize task (MERGED STRUCTURE)
+	taskID := fmt.Sprintf("task-%s", uuid.New().String()[:8])
+	taskKey := etcd.TaskKeyV3(req.IDC, req.SN)
+
+	task := models.TaskV3{
+		TaskID:      taskID,
+		SN:          req.SN,
+		MAC:         req.MAC,
+		OSType:      req.OSType,
+		OSVersion:   req.OSVersion,
+		DiskLayout:  req.DiskLayout,
+		NetworkConf: req.NetworkConf,
+		Status:      models.TaskStatusPending,
+		StatusHistory: []models.StatusChange{
+			{
+				Status:    models.TaskStatusPending,
+				Timestamp: time.Now(),
+				Reason:    "Task created",
+			},
+		},
+		Progress:  []models.ProgressStep{},
+		Logs:      []string{fmt.Sprintf("[INFO] Task created for %s in %s", req.SN, req.IDC)},
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		CreatedBy: "admin",
+	}
+
+	if err := cp.etcdClient.Put(taskKey, task); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to create task: %v", err)})
+		return
+	}
+
+	log.Printf("[%s] Created task %s for server %s", req.IDC, taskID, req.SN)
+
+	// Broadcast via WebSocket
+	cp.wsHub.Broadcast <- models.WebSocketMessage{
+		Type:    "task_created",
+		IDC:     req.IDC,
+		SN:      req.SN,
+		Payload: task,
+	}
+
+	c.JSON(http.StatusCreated, task)
+}
+
+// listTasks lists all tasks across all IDCs
+func (cp *ControlPlane) listTasks(c *gin.Context) {
+	idc := c.Query("idc")
+
+	var tasks []models.TaskV3
+	var prefix string
+
+	if idc != "" {
+		prefix = etcd.MachinePrefix(idc)
+	} else {
+		prefix = "/os/"
+	}
+
+	kvs, err := cp.etcdClient.GetWithPrefix(prefix)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	for key, value := range kvs {
+		if strings.HasSuffix(key, "/task") {
+			var task models.TaskV3
+			if err := json.Unmarshal(value, &task); err == nil {
+				tasks = append(tasks, task)
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, tasks)
+}
+
+// getTask retrieves a specific task
+func (cp *ControlPlane) getTask(c *gin.Context) {
+	idc := c.Param("idc")
+	sn := c.Param("sn")
+
+	taskKey := etcd.TaskKeyV3(idc, sn)
+	var task models.TaskV3
+
+	if err := cp.etcdClient.GetJSON(taskKey, &task); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, task)
+}
+
+// approveTask approves a task using ATOMIC UPDATE
+func (cp *ControlPlane) approveTask(c *gin.Context) {
+	idc := c.Param("idc")
+	sn := c.Param("sn")
+
+	var req models.ApprovalRequest
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	taskKey := etcd.TaskKeyV3(idc, sn)
+
+	// Atomic update
+	err := cp.etcdClient.AtomicUpdate(taskKey, func(data []byte) (interface{}, error) {
+		var task models.TaskV3
+		if err := json.Unmarshal(data, &task); err != nil {
+			return nil, err
+		}
+
+		// Update approval
+		now := time.Now()
+		task.Approval = &models.Approval{
+			Approved:   true,
+			ApprovedBy: "admin",
+			ApprovedAt: &now,
+			Notes:      req.Notes,
+		}
+
+		// Update status
+		task.Status = models.TaskStatusApproved
+		task.StatusHistory = append(task.StatusHistory, models.StatusChange{
+			Status:    models.TaskStatusApproved,
+			Timestamp: now,
+			Reason:    "Approved by admin",
+		})
+
+		task.Logs = append(task.Logs, fmt.Sprintf("[INFO] Task approved: %s", req.Notes))
+		task.UpdatedAt = now
+
+		return task, nil
+	})
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	log.Printf("[%s] Approved task for %s", idc, sn)
+
+	// Broadcast update
+	var task models.TaskV3
+	cp.etcdClient.GetJSON(taskKey, &task)
+	cp.wsHub.Broadcast <- models.WebSocketMessage{
+		Type:    "task_approved",
+		IDC:     idc,
+		SN:      sn,
+		Payload: task,
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Task approved"})
+}
+
+// rejectTask rejects a task using ATOMIC UPDATE
+func (cp *ControlPlane) rejectTask(c *gin.Context) {
+	idc := c.Param("idc")
+	sn := c.Param("sn")
+
+	var req models.ApprovalRequest
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	taskKey := etcd.TaskKeyV3(idc, sn)
+
+	// Atomic update
+	err := cp.etcdClient.AtomicUpdate(taskKey, func(data []byte) (interface{}, error) {
+		var task models.TaskV3
+		if err := json.Unmarshal(data, &task); err != nil {
+			return nil, err
+		}
+
+		// Update approval
+		now := time.Now()
+		task.Approval = &models.Approval{
+			Approved:   false,
+			RejectedBy: "admin",
+			RejectedAt: &now,
+			Reason:     req.Reason,
+		}
+
+		// Update status
+		task.Status = models.TaskStatusFailed
+		task.StatusHistory = append(task.StatusHistory, models.StatusChange{
+			Status:    models.TaskStatusFailed,
+			Timestamp: now,
+			Reason:    fmt.Sprintf("Rejected: %s", req.Reason),
+		})
+
+		task.Logs = append(task.Logs, fmt.Sprintf("[ERROR] Task rejected: %s", req.Reason))
+		task.UpdatedAt = now
+
+		return task, nil
+	})
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	log.Printf("[%s] Rejected task for %s: %s", idc, sn, req.Reason)
+	c.JSON(http.StatusOK, gin.H{"message": "Task rejected"})
+}
+
+// listServers lists all servers in an IDC (INDIVIDUAL KEYS)
+func (cp *ControlPlane) listServers(c *gin.Context) {
+	idc := c.Param("idc")
+	prefix := etcd.ServerPrefix(idc)
+
+	kvs, err := cp.etcdClient.GetWithPrefix(prefix)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	var servers []models.ServerEntry
+	for _, value := range kvs {
+		var server models.ServerEntry
+		if err := json.Unmarshal(value, &server); err == nil {
+			servers = append(servers, server)
+		}
+	}
+
+	c.JSON(http.StatusOK, servers)
+}
+
+// getStats retrieves statistics for an IDC
+func (cp *ControlPlane) getStats(c *gin.Context) {
+	idc := c.Param("idc")
+	statsKey := etcd.StatsKey(idc)
+
+	var stats models.IDCStats
+	if err := cp.etcdClient.GetJSON(statsKey, &stats); err != nil {
+		// Calculate stats if not cached
+		stats = cp.calculateStats(idc)
+		cp.etcdClient.Put(statsKey, stats)
+	}
+
+	c.JSON(http.StatusOK, stats)
+}
+
+// getAllStats retrieves statistics for all IDCs
+func (cp *ControlPlane) getAllStats(c *gin.Context) {
+	prefix := etcd.KeyPrefixGlobalStats
+	kvs, err := cp.etcdClient.GetWithPrefix(prefix)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	var allStats []models.IDCStats
+	for _, value := range kvs {
+		var stats models.IDCStats
+		if err := json.Unmarshal(value, &stats); err == nil {
+			allStats = append(allStats, stats)
+		}
+	}
+
+	c.JSON(http.StatusOK, allStats)
+}
+
+// calculateStats calculates statistics for an IDC
+func (cp *ControlPlane) calculateStats(idc string) models.IDCStats {
+	stats := models.IDCStats{
+		IDC:         idc,
+		LastUpdated: time.Now(),
+	}
+
+	prefix := etcd.MachinePrefix(idc)
+	kvs, _ := cp.etcdClient.GetWithPrefix(prefix)
+
+	for key, value := range kvs {
+		if strings.HasSuffix(key, "/task") {
+			var task models.TaskV3
+			if err := json.Unmarshal(value, &task); err == nil {
+				stats.TotalMachines++
+				switch task.Status {
+				case models.TaskStatusPending:
+					stats.Pending++
+				case models.TaskStatusInstalling:
+					stats.Installing++
+				case models.TaskStatusCompleted:
+					stats.Completed++
+				case models.TaskStatusFailed:
+					stats.Failed++
+				}
+			}
+		}
+	}
+
+	return stats
+}
+
+// watchTasks watches for task updates and broadcasts via WebSocket
+func (cp *ControlPlane) watchTasks() {
+	watchChan := cp.etcdClient.Watch(cp.ctx, "/os/", true)
+
+	for watchResp := range watchChan {
+		for _, event := range watchResp.Events {
+			key := string(event.Kv.Key)
+
+			// Only process task updates
+			if !strings.HasSuffix(key, "/task") {
+				continue
+			}
+
+			if event.Type == clientv3.EventTypePut {
+				var task models.TaskV3
+				if err := json.Unmarshal(event.Kv.Value, &task); err == nil {
+					// Extract IDC from key
+					parts := strings.Split(key, "/")
+					if len(parts) >= 3 {
+						idc := parts[2]
+						cp.wsHub.Broadcast <- models.WebSocketMessage{
+							Type:    "task_update",
+							IDC:     idc,
+							SN:      task.SN,
+							Payload: task,
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// watchLeases watches for lease deletions (agent offline detection)
+func (cp *ControlPlane) watchLeases() {
+	watchChan := cp.etcdClient.Watch(cp.ctx, "/os/", true)
+
+	for watchResp := range watchChan {
+		for _, event := range watchResp.Events {
+			key := string(event.Kv.Key)
+
+			// Detect lease deletions
+			if event.Type == clientv3.EventTypeDelete && strings.HasSuffix(key, "/lease") {
+				parts := strings.Split(key, "/")
+				if len(parts) >= 5 {
+					idc := parts[2]
+					sn := parts[4]
+
+					log.Printf("[%s] Agent offline detected: %s", idc, sn)
+
+					// Mark task as failed using atomic update
+					taskKey := etcd.TaskKeyV3(idc, sn)
+					cp.etcdClient.AtomicUpdate(taskKey, func(data []byte) (interface{}, error) {
+						var task models.TaskV3
+						json.Unmarshal(data, &task)
+
+						if task.Status == models.TaskStatusInstalling {
+							task.Status = models.TaskStatusFailed
+							task.StatusHistory = append(task.StatusHistory, models.StatusChange{
+								Status:    models.TaskStatusFailed,
+								Timestamp: time.Now(),
+								Reason:    "Agent went offline (lease expired)",
+							})
+							task.Logs = append(task.Logs, "[ERROR] Agent connection lost")
+							task.UpdatedAt = time.Now()
+						}
+
+						return task, nil
+					})
+				}
+			}
+		}
+	}
+}
+
+const dashboardHTML = `<!DOCTYPE html>
+<html>
+<head>
+    <title>LPMOS v3.0 Dashboard</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        .header { background: #2c3e50; color: white; padding: 20px; border-radius: 5px; margin-bottom: 20px; }
+        .status { display: inline-block; padding: 5px 10px; border-radius: 3px; font-size: 12px; }
+        .status.pending { background: #f39c12; color: white; }
+        .status.approved { background: #3498db; color: white; }
+        .status.installing { background: #9b59b6; color: white; }
+        .status.completed { background: #27ae60; color: white; }
+        .status.failed { background: #e74c3c; color: white; }
+        .task-card { background: white; padding: 15px; margin: 10px 0; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .progress-bar { width: 100%; height: 20px; background: #ecf0f1; border-radius: 10px; overflow: hidden; margin: 10px 0; }
+        .progress-fill { height: 100%; background: #3498db; transition: width 0.3s; }
+        .logs { background: #2c3e50; color: #ecf0f1; padding: 10px; border-radius: 5px; font-family: monospace; font-size: 12px; max-height: 200px; overflow-y: auto; }
+        .connection { float: right; }
+        .connection.connected { color: #27ae60; }
+        .connection.disconnected { color: #e74c3c; }
+        button { background: #3498db; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; margin: 5px; }
+        button:hover { background: #2980b9; }
+        button.reject { background: #e74c3c; }
+        button.reject:hover { background: #c0392b; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>LPMOS v3.0 Dashboard <span class="connection" id="wsStatus">●</span></h1>
+        <p>Optimized etcd Schema | Real-time Monitoring</p>
+        <a href="/tasks/create" style="color: white;">➕ Create Task</a>
+    </div>
+
+    <div id="tasks"></div>
+
+    <script>
+        let ws = null;
+        let tasks = {};
+
+        function connect() {
+            ws = new WebSocket('ws://' + window.location.host + '/ws');
+
+            ws.onopen = () => {
+                document.getElementById('wsStatus').className = 'connection connected';
+                console.log('WebSocket connected');
+                loadTasks();
+            };
+
+            ws.onclose = () => {
+                document.getElementById('wsStatus').className = 'connection disconnected';
+                console.log('WebSocket disconnected, reconnecting...');
+                setTimeout(connect, 3000);
+            };
+
+            ws.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                if (msg.type === 'task_update' || msg.type === 'task_created' || msg.type === 'task_approved') {
+                    tasks[msg.payload.sn] = msg.payload;
+                    renderTasks();
+                }
+            };
+        }
+
+        function loadTasks() {
+            fetch('/api/v1/tasks')
+                .then(r => r.json())
+                .then(data => {
+                    data.forEach(task => tasks[task.sn] = task);
+                    renderTasks();
+                });
+        }
+
+        function renderTasks() {
+            const container = document.getElementById('tasks');
+            container.innerHTML = '';
+
+            Object.values(tasks).forEach(task => {
+                const latestProgress = task.progress && task.progress.length > 0
+                    ? task.progress[task.progress.length - 1]
+                    : { percent: 0, step: 'Pending', message: '' };
+
+                const card = document.createElement('div');
+                card.className = 'task-card';
+                card.innerHTML = `
+                    <h3>${task.sn} <span class="status ${task.status}">${task.status}</span></h3>
+                    <p><strong>OS:</strong> ${task.os_type} ${task.os_version} | <strong>MAC:</strong> ${task.mac || 'N/A'}</p>
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: ${latestProgress.percent}%"></div>
+                    </div>
+                    <p><strong>Progress:</strong> ${latestProgress.step} (${latestProgress.percent}%) ${latestProgress.message || ''}</p>
+                    ${task.status === 'pending' ? `
+                        <button onclick="approveTask('${task.sn}')">✓ Approve</button>
+                        <button class="reject" onclick="rejectTask('${task.sn}')">✗ Reject</button>
+                    ` : ''}
+                    ${task.logs && task.logs.length > 0 ? `
+                        <details>
+                            <summary>Logs (${task.logs.length})</summary>
+                            <div class="logs">${task.logs.slice(-10).join('\n')}</div>
+                        </details>
+                    ` : ''}
+                `;
+                container.appendChild(card);
+            });
+        }
+
+        function approveTask(sn) {
+            const task = tasks[sn];
+            const idc = extractIDC(task);
+
+            fetch(`/api/v1/tasks/${idc}/${sn}/approve`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ notes: 'Approved from dashboard' })
+            }).then(() => loadTasks());
+        }
+
+        function rejectTask(sn) {
+            const reason = prompt('Rejection reason:');
+            if (!reason) return;
+
+            const task = tasks[sn];
+            const idc = extractIDC(task);
+
+            fetch(`/api/v1/tasks/${idc}/${sn}/reject`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ reason: reason })
+            }).then(() => loadTasks());
+        }
+
+        function extractIDC(task) {
+            return 'dc1'; // Default for demo
+        }
+
+        connect();
+    </script>
+</body>
+</html>`
+
+const addTaskHTML = `<!DOCTYPE html>
+<html>
+<head>
+    <title>Create Task - LPMOS v3.0</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 5px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        h1 { color: #2c3e50; }
+        label { display: block; margin-top: 15px; color: #34495e; font-weight: bold; }
+        input, select, textarea { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid #ddd; border-radius: 3px; font-size: 14px; box-sizing: border-box; }
+        button { background: #3498db; color: white; border: none; padding: 12px 30px; border-radius: 5px; cursor: pointer; margin-top: 20px; font-size: 16px; }
+        button:hover { background: #2980b9; }
+        .success { background: #27ae60; color: white; padding: 15px; border-radius: 5px; margin-top: 20px; display: none; }
+        .error { background: #e74c3c; color: white; padding: 15px; border-radius: 5px; margin-top: 20px; display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Create Installation Task</h1>
+        <form id="taskForm">
+            <label>IDC / Region *</label>
+            <input type="text" id="idc" required placeholder="e.g., dc1, us-west-1">
+
+            <label>Server Serial Number (SN) *</label>
+            <input type="text" id="sn" required placeholder="e.g., sn-001">
+
+            <label>MAC Address</label>
+            <input type="text" id="mac" placeholder="e.g., 00:1a:2b:3c:4d:5e">
+
+            <label>OS Type *</label>
+            <select id="os_type" required>
+                <option value="">Select OS</option>
+                <option value="Ubuntu 22.04">Ubuntu 22.04</option>
+                <option value="Ubuntu 20.04">Ubuntu 20.04</option>
+                <option value="CentOS 7">CentOS 7</option>
+                <option value="Rocky Linux 9">Rocky Linux 9</option>
+            </select>
+
+            <label>OS Version *</label>
+            <input type="text" id="os_version" required placeholder="e.g., 22.04">
+
+            <label>Disk Layout</label>
+            <input type="text" id="disk_layout" placeholder="auto">
+
+            <label>Network Config</label>
+            <input type="text" id="network_config" placeholder="dhcp">
+
+            <button type="submit">Create Task</button>
+        </form>
+
+        <div class="success" id="success"></div>
+        <div class="error" id="error"></div>
+
+        <p style="margin-top: 30px;">
+            <a href="/">← Back to Dashboard</a>
+        </p>
+    </div>
+
+    <script>
+        document.getElementById('taskForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const data = {
+                idc: document.getElementById('idc').value,
+                sn: document.getElementById('sn').value,
+                mac: document.getElementById('mac').value,
+                os_type: document.getElementById('os_type').value,
+                os_version: document.getElementById('os_version').value,
+                disk_layout: document.getElementById('disk_layout').value || 'auto',
+                network_config: document.getElementById('network_config').value || 'dhcp'
+            };
+
+            try {
+                const response = await fetch('/api/v1/tasks', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(data)
+                });
+
+                if (response.ok) {
+                    const result = await response.json();
+                    document.getElementById('success').textContent = `Task created successfully: ${result.task_id}`;
+                    document.getElementById('success').style.display = 'block';
+                    document.getElementById('error').style.display = 'none';
+                    document.getElementById('taskForm').reset();
+
+                    setTimeout(() => {
+                        window.location.href = '/';
+                    }, 2000);
+                } else {
+                    const error = await response.json();
+                    document.getElementById('error').textContent = `Error: ${error.error}`;
+                    document.getElementById('error').style.display = 'block';
+                    document.getElementById('success').style.display = 'none';
+                }
+            } catch (err) {
+                document.getElementById('error').textContent = `Network error: ${err.message}`;
+                document.getElementById('error').style.display = 'block';
+                document.getElementById('success').style.display = 'none';
+            }
+        });
+    </script>
+</body>
+</html>`

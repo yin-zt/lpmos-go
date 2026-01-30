@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Add Installation Task - LPMOS</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #f5f5f5;
+            color: #333;
+        }
+
+        .header {
+            background: #2c3e50;
+            color: white;
+            padding: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .header h1 {
+            font-size: 24px;
+            font-weight: 600;
+        }
+
+        .header .subtitle {
+            font-size: 14px;
+            opacity: 0.8;
+            margin-top: 5px;
+        }
+
+        .header .nav {
+            margin-top: 15px;
+        }
+
+        .header .nav a {
+            color: white;
+            text-decoration: none;
+            margin-right: 20px;
+            opacity: 0.8;
+        }
+
+        .header .nav a:hover {
+            opacity: 1;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 40px auto;
+            padding: 0 20px;
+        }
+
+        .form-card {
+            background: white;
+            border-radius: 8px;
+            padding: 30px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+
+        .form-card h2 {
+            font-size: 20px;
+            margin-bottom: 20px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-group label {
+            display: block;
+            font-size: 14px;
+            font-weight: 500;
+            margin-bottom: 8px;
+            color: #555;
+        }
+
+        .form-group label .required {
+            color: #e74c3c;
+        }
+
+        .form-group input,
+        .form-group select,
+        .form-group textarea {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+            font-family: inherit;
+        }
+
+        .form-group input:focus,
+        .form-group select:focus,
+        .form-group textarea:focus {
+            outline: none;
+            border-color: #3498db;
+            box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.1);
+        }
+
+        .form-group .help-text {
+            font-size: 12px;
+            color: #666;
+            margin-top: 5px;
+        }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 10px;
+            margin-top: 30px;
+        }
+
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .btn-primary {
+            background: #3498db;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #2980b9;
+        }
+
+        .btn-primary:disabled {
+            background: #95a5a6;
+            cursor: not-allowed;
+        }
+
+        .btn-secondary {
+            background: #ecf0f1;
+            color: #333;
+        }
+
+        .btn-secondary:hover {
+            background: #dfe6e9;
+        }
+
+        .alert {
+            padding: 12px 16px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
+
+        .alert-success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .alert-error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+        }
+
+        .loading.active {
+            display: block;
+        }
+
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #3498db;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🖥️ LPMOS - Add Installation Task</h1>
+        <div class="subtitle">Create a new OS installation task for a bare-metal server</div>
+        <div class="nav">
+            <a href="/">← Back to Dashboard</a>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="form-card">
+            <h2>New Installation Task</h2>
+
+            <div id="alert-container"></div>
+
+            <form id="task-form">
+                <div class="form-group">
+                    <label for="region_id">Region <span class="required">*</span></label>
+                    <select id="region_id" name="region_id" required>
+                        <option value="">-- Select Region --</option>
+                        <option value="dc1">dc1 - Data Center 1</option>
+                        <option value="dc2">dc2 - Data Center 2</option>
+                        <option value="dc3">dc3 - Data Center 3</option>
+                    </select>
+                    <div class="help-text">Select the data center where the server is located</div>
+                </div>
+
+                <div class="form-group">
+                    <label for="target_mac">Target MAC Address <span class="required">*</span></label>
+                    <input type="text" id="target_mac" name="target_mac"
+                           placeholder="00:1a:2b:3c:4d:5e"
+                           pattern="([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}"
+                           required>
+                    <div class="help-text">MAC address of the target server (format: xx:xx:xx:xx:xx:xx)</div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="os_type">OS Type <span class="required">*</span></label>
+                        <select id="os_type" name="os_type" required>
+                            <option value="">-- Select OS --</option>
+                            <option value="ubuntu">Ubuntu</option>
+                            <option value="centos">CentOS</option>
+                            <option value="rocky">Rocky Linux</option>
+                            <option value="debian">Debian</option>
+                            <option value="rhel">RHEL</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="os_version">OS Version <span class="required">*</span></label>
+                        <input type="text" id="os_version" name="os_version"
+                               placeholder="22.04" required>
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="disk_layout">Disk Layout</label>
+                        <select id="disk_layout" name="disk_layout">
+                            <option value="auto">Automatic</option>
+                            <option value="manual">Manual</option>
+                            <option value="raid1">RAID 1</option>
+                            <option value="raid5">RAID 5</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="network_config">Network Config</label>
+                        <select id="network_config" name="network_config">
+                            <option value="dhcp">DHCP</option>
+                            <option value="static">Static IP</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label for="tags">Tags (optional)</label>
+                    <input type="text" id="tags" name="tags"
+                           placeholder="environment:production,purpose:web-server">
+                    <div class="help-text">Comma-separated key:value pairs</div>
+                </div>
+
+                <div class="form-group">
+                    <label for="notes">Notes (optional)</label>
+                    <textarea id="notes" name="notes" rows="3"
+                              placeholder="Additional notes about this installation..."></textarea>
+                </div>
+
+                <div class="loading" id="loading">
+                    <div class="spinner"></div>
+                    <p style="margin-top: 10px;">Creating task...</p>
+                </div>
+
+                <div class="btn-group">
+                    <button type="submit" class="btn btn-primary" id="submit-btn">Create Task</button>
+                    <button type="button" class="btn btn-secondary" onclick="window.location.href='/'">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        // Load available regions from API
+        fetch('/api/v1/regions')
+            .then(res => res.json())
+            .then(data => {
+                const select = document.getElementById('region_id');
+                select.innerHTML = '<option value="">-- Select Region --</option>';
+
+                if (data.regions && data.regions.length > 0) {
+                    data.regions.forEach(region => {
+                        const option = document.createElement('option');
+                        option.value = region.id;
+                        option.textContent = `${region.id} - ${region.status === 'online' ? '🟢 Online' : '🔴 Offline'}`;
+                        select.appendChild(option);
+                    });
+                } else {
+                    // Fallback to hardcoded regions
+                    ['dc1', 'dc2', 'dc3'].forEach(id => {
+                        const option = document.createElement('option');
+                        option.value = id;
+                        option.textContent = id;
+                        select.appendChild(option);
+                    });
+                }
+            })
+            .catch(err => {
+                console.error('Failed to load regions:', err);
+            });
+
+        // Form submission
+        document.getElementById('task-form').addEventListener('submit', function(e) {
+            e.preventDefault();
+
+            const formData = new FormData(e.target);
+            const data = {
+                region_id: formData.get('region_id'),
+                target_mac: formData.get('target_mac'),
+                os_type: formData.get('os_type'),
+                os_version: formData.get('os_version'),
+                disk_layout: formData.get('disk_layout') || 'auto',
+                network_config: formData.get('network_config') || 'dhcp',
+            };
+
+            // Parse tags
+            const tagsStr = formData.get('tags');
+            if (tagsStr) {
+                const tags = {};
+                tagsStr.split(',').forEach(pair => {
+                    const [key, value] = pair.split(':').map(s => s.trim());
+                    if (key && value) {
+                        tags[key] = value;
+                    }
+                });
+                if (Object.keys(tags).length > 0) {
+                    data.tags = tags;
+                }
+            }
+
+            // Add notes if provided
+            const notes = formData.get('notes');
+            if (notes) {
+                data.notes = notes;
+            }
+
+            // Show loading
+            document.getElementById('loading').classList.add('active');
+            document.getElementById('submit-btn').disabled = true;
+
+            // Submit to API
+            fetch('/api/v1/tasks', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(data)
+            })
+            .then(res => res.json())
+            .then(result => {
+                document.getElementById('loading').classList.remove('active');
+                document.getElementById('submit-btn').disabled = false;
+
+                if (result.task_id) {
+                    showAlert('success', `Task created successfully! Task ID: ${result.task_id}`);
+
+                    setTimeout(() => {
+                        window.location.href = '/';
+                    }, 2000);
+                } else {
+                    showAlert('error', result.error || 'Failed to create task');
+                }
+            })
+            .catch(err => {
+                document.getElementById('loading').classList.remove('active');
+                document.getElementById('submit-btn').disabled = false;
+                showAlert('error', 'Failed to create task: ' + err.message);
+            });
+        });
+
+        function showAlert(type, message) {
+            const container = document.getElementById('alert-container');
+            const alert = document.createElement('div');
+            alert.className = `alert alert-${type}`;
+            alert.textContent = message;
+            container.appendChild(alert);
+
+            setTimeout(() => {
+                alert.remove();
+            }, 5000);
+        }
+    </script>
+</body>
+</html>

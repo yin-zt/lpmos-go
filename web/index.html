@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LPMOS - 装机管理平台</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: #f5f7fa;
+            color: #333;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px 40px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .header h1 { font-size: 28px; font-weight: 600; }
+        .header .subtitle { font-size: 14px; opacity: 0.9; margin-top: 5px; }
+        .connection-status {
+            float: right;
+            margin-top: 10px;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 12px;
+            background: rgba(255,255,255,0.2);
+        }
+        .connection-status.connected::before { content: "● "; color: #4ade80; }
+        .connection-status.disconnected::before { content: "● "; color: #f87171; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 30px 40px; }
+        .actions { margin-bottom: 30px; }
+        .btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.3s;
+            box-shadow: 0 2px 5px rgba(102, 126, 234, 0.3);
+        }
+        .btn:hover {
+            background: #5568d3;
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+            transform: translateY(-1px);
+        }
+        .btn-success { background: #10b981; }
+        .btn-success:hover { background: #059669; }
+        .btn-danger { background: #ef4444; }
+        .btn-danger:hover { background: #dc2626; }
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            transition: transform 0.2s;
+        }
+        .stat-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.12);
+        }
+        .stat-card .label {
+            font-size: 13px;
+            color: #64748b;
+            margin-bottom: 8px;
+        }
+        .stat-card .value {
+            font-size: 32px;
+            font-weight: 700;
+            color: #1e293b;
+        }
+        .stat-card.pending .value { color: #f59e0b; }
+        .stat-card.installing .value { color: #3b82f6; }
+        .stat-card.completed .value { color: #10b981; }
+        .stat-card.failed .value { color: #ef4444; }
+        .tasks-section {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            padding: 30px;
+            margin-bottom: 20px;
+        }
+        .section-title {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 20px;
+            color: #1e293b;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .idc-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 15px;
+            font-size: 11px;
+            font-weight: 600;
+            background: #f1f5f9;
+            color: #475569;
+            margin-left: 10px;
+        }
+        .idc-badge.dc1 { background: #dbeafe; color: #1e40af; }
+        .idc-badge.dc2 { background: #fef3c7; color: #92400e; }
+        .idc-badge.dc3 { background: #d1fae5; color: #065f46; }
+        .task-list { display: grid; gap: 20px; }
+        .task-card {
+            border: 1px solid #e2e8f0;
+            border-radius: 10px;
+            padding: 20px;
+            transition: all 0.3s;
+            position: relative;
+            overflow: hidden;
+        }
+        .task-card:hover {
+            border-color: #667eea;
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.15);
+        }
+        .task-card::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 0;
+            bottom: 0;
+            width: 4px;
+        }
+        .task-card.pending::before { background: #f59e0b; }
+        .task-card.approved::before { background: #3b82f6; }
+        .task-card.installing::before { background: #8b5cf6; }
+        .task-card.completed::before { background: #10b981; }
+        .task-card.failed::before { background: #ef4444; }
+        .task-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        .task-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: #1e293b;
+        }
+        .task-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        .task-badge.pending { background: #fef3c7; color: #92400e; }
+        .task-badge.approved { background: #dbeafe; color: #1e40af; }
+        .task-badge.installing { background: #ede9fe; color: #5b21b6; }
+        .task-badge.completed { background: #d1fae5; color: #065f46; }
+        .task-badge.failed { background: #fee2e2; color: #991b1b; }
+        .task-info {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 15px;
+            font-size: 13px;
+        }
+        .task-info-label { color: #64748b; margin-right: 8px; }
+        .task-info-value { color: #1e293b; font-weight: 500; }
+        .progress-bar {
+            width: 100%;
+            height: 8px;
+            background: #e2e8f0;
+            border-radius: 10px;
+            overflow: hidden;
+            margin: 15px 0;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            transition: width 0.5s ease;
+            border-radius: 10px;
+        }
+        .progress-text { font-size: 12px; color: #64748b; margin-top: 5px; }
+        .task-actions { display: flex; gap: 10px; margin-top: 15px; }
+        .task-actions button { padding: 8px 16px; font-size: 13px; }
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+        .modal.active { display: flex; }
+        .modal-content {
+            background: white;
+            border-radius: 12px;
+            padding: 30px;
+            max-width: 600px;
+            width: 90%;
+            max-height: 90vh;
+            overflow-y: auto;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        .modal-header { font-size: 24px; font-weight: 600; margin-bottom: 25px; }
+        .form-group { margin-bottom: 20px; }
+        .form-label {
+            display: block;
+            font-size: 14px;
+            font-weight: 500;
+            color: #475569;
+            margin-bottom: 8px;
+        }
+        .form-label .required { color: #ef4444; }
+        .form-input, .form-select {
+            width: 100%;
+            padding: 12px 15px;
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 14px;
+        }
+        .form-input:focus, .form-select:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+        .form-help { font-size: 12px; color: #64748b; margin-top: 5px; }
+        .modal-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+            margin-top: 30px;
+        }
+        .btn-secondary { background: #e2e8f0; color: #475569; }
+        .btn-secondary:hover { background: #cbd5e1; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="connection-status" id="wsStatus">连接中...</div>
+        <h1>LPMOS 装机管理平台</h1>
+        <div class="subtitle">Linux Provisioning and Management OS System</div>
+    </div>
+
+    <div class="container">
+        <div class="actions">
+            <button class="btn" onclick="showCreateModal()">➕ 新建装机任务</button>
+            <button class="btn btn-secondary" onclick="refreshTasks()" style="margin-left: 10px;">🔄 刷新</button>
+        </div>
+
+        <div class="stats">
+            <div class="stat-card pending">
+                <div class="label">待审批</div>
+                <div class="value" id="stat-pending">0</div>
+            </div>
+            <div class="stat-card installing">
+                <div class="label">安装中</div>
+                <div class="value" id="stat-installing">0</div>
+            </div>
+            <div class="stat-card completed">
+                <div class="label">已完成</div>
+                <div class="value" id="stat-completed">0</div>
+            </div>
+            <div class="stat-card failed">
+                <div class="label">失败</div>
+                <div class="value" id="stat-failed">0</div>
+            </div>
+        </div>
+
+        <div class="tasks-section">
+            <div class="section-title">
+                <span>待审批任务</span>
+            </div>
+            <div class="task-list" id="pendingTaskList"></div>
+        </div>
+
+        <div class="tasks-section">
+            <div class="section-title">
+                <span>安装中任务</span>
+            </div>
+            <div class="task-list" id="installingTaskList"></div>
+        </div>
+
+        <div class="tasks-section">
+            <div class="section-title">
+                <span>已完成任务</span>
+            </div>
+            <div class="task-list" id="completedTaskList"></div>
+        </div>
+    </div>
+
+    <!-- 创建任务Modal -->
+    <div class="modal" id="createModal">
+        <div class="modal-content">
+            <div class="modal-header">新建装机任务</div>
+            <form id="createForm" onsubmit="createTask(event)">
+                <div class="form-group">
+                    <label class="form-label">机房 <span class="required">*</span></label>
+                    <select class="form-select" id="idc" required>
+                        <option value="">请选择机房</option>
+                        <option value="dc1">DC1 - 北京数据中心</option>
+                        <option value="dc2">DC2 - 上海数据中心</option>
+                        <option value="dc3">DC3 - 深圳数据中心</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">服务器序列号 (SN) <span class="required">*</span></label>
+                    <input type="text" class="form-input" id="sn" placeholder="例如: sn-001" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">MAC地址</label>
+                    <input type="text" class="form-input" id="mac" placeholder="例如: 00:1a:2b:3c:4d:5e">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">操作系统 <span class="required">*</span></label>
+                    <select class="form-select" id="os_type" required>
+                        <option value="">请选择操作系统</option>
+                        <option value="Ubuntu 22.04">Ubuntu 22.04 LTS</option>
+                        <option value="Ubuntu 20.04">Ubuntu 20.04 LTS</option>
+                        <option value="CentOS 7">CentOS 7</option>
+                        <option value="Rocky Linux 9">Rocky Linux 9</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">系统版本 <span class="required">*</span></label>
+                    <input type="text" class="form-input" id="os_version" placeholder="例如: 22.04" required>
+                </div>
+                <div class="modal-actions">
+                    <button type="button" class="btn btn-secondary" onclick="hideCreateModal()">取消</button>
+                    <button type="submit" class="btn">创建任务</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let tasks = {};
+
+        function connectWebSocket() {
+            ws = new WebSocket('ws://' + window.location.host + '/ws');
+            ws.onopen = () => {
+                document.getElementById('wsStatus').className = 'connection-status connected';
+                document.getElementById('wsStatus').textContent = '已连接';
+            };
+            ws.onclose = () => {
+                document.getElementById('wsStatus').className = 'connection-status disconnected';
+                document.getElementById('wsStatus').textContent = '未连接';
+                setTimeout(connectWebSocket, 3000);
+            };
+            ws.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                if (msg.payload) {
+                    tasks[msg.payload.sn] = msg.payload;
+                    renderTasks();
+                }
+            };
+        }
+
+        function loadTasks() {
+            fetch('/api/v1/tasks')
+                .then(r => r.json())
+                .then(data => {
+                    tasks = {};
+                    (data || []).forEach(task => tasks[task.sn] = task);
+                    renderTasks();
+                });
+        }
+
+        function renderTasks() {
+            const taskList = Object.values(tasks);
+            updateStats();
+
+            // 按状态分组
+            const pending = taskList.filter(t => t.status === 'pending' || t.status === 'approved');
+            const installing = taskList.filter(t => t.status === 'installing');
+            const completed = taskList.filter(t => t.status === 'completed' || t.status === 'failed');
+
+            // 渲染待审批任务
+            renderTaskGroup('pendingTaskList', pending);
+            // 渲染安装中任务
+            renderTaskGroup('installingTaskList', installing);
+            // 渲染已完成任务
+            renderTaskGroup('completedTaskList', completed);
+        }
+
+        function renderTaskGroup(containerId, taskList) {
+            const container = document.getElementById(containerId);
+
+            if (taskList.length === 0) {
+                container.innerHTML = '<div style="text-align:center;padding:40px;color:#94a3b8;">暂无任务</div>';
+                return;
+            }
+
+            container.innerHTML = taskList.map(task => {
+                const latestProgress = task.progress && task.progress.length > 0
+                    ? task.progress[task.progress.length - 1]
+                    : { percent: 0, step: '等待中', message: '' };
+
+                const idcName = getIDCName(task.idc || 'dc1');
+
+                return `
+                    <div class="task-card ${task.status}">
+                        <div class="task-header">
+                            <div class="task-title">
+                                ${task.sn}
+                                <span class="idc-badge ${task.idc || 'dc1'}">${idcName}</span>
+                            </div>
+                            <div class="task-badge ${task.status}">${getStatusText(task.status)}</div>
+                        </div>
+                        <div class="task-info">
+                            <div><span class="task-info-label">操作系统:</span><span class="task-info-value">${task.os_type}</span></div>
+                            <div><span class="task-info-label">MAC:</span><span class="task-info-value">${task.mac || 'N/A'}</span></div>
+                            <div><span class="task-info-label">创建时间:</span><span class="task-info-value">${task.created_at ? new Date(task.created_at).toLocaleString('zh-CN') : 'N/A'}</span></div>
+                        </div>
+                        <div class="progress-bar">
+                            <div class="progress-fill" style="width: ${latestProgress.percent}%"></div>
+                        </div>
+                        <div class="progress-text">${latestProgress.step} (${latestProgress.percent}%)</div>
+                        ${task.status === 'pending' ? `
+                            <div class="task-actions">
+                                <button class="btn btn-success" onclick="approveTask('${task.idc || 'dc1'}', '${task.sn}')">✓ 审批</button>
+                                <button class="btn btn-danger" onclick="rejectTask('${task.idc || 'dc1'}', '${task.sn}')">✗ 拒绝</button>
+                            </div>
+                        ` : ''}
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function getIDCName(idc) {
+            const names = {
+                'dc1': 'DC1 北京',
+                'dc2': 'DC2 上海',
+                'dc3': 'DC3 深圳'
+            };
+            return names[idc] || idc.toUpperCase();
+        }
+
+        function updateStats() {
+            const stats = { pending: 0, installing: 0, completed: 0, failed: 0 };
+            Object.values(tasks).forEach(task => {
+                if (task.status === 'pending' || task.status === 'approved') stats.pending++;
+                else if (task.status === 'installing') stats.installing++;
+                else if (task.status === 'completed') stats.completed++;
+                else if (task.status === 'failed') stats.failed++;
+            });
+            document.getElementById('stat-pending').textContent = stats.pending;
+            document.getElementById('stat-installing').textContent = stats.installing;
+            document.getElementById('stat-completed').textContent = stats.completed;
+            document.getElementById('stat-failed').textContent = stats.failed;
+        }
+
+        function showCreateModal() {
+            document.getElementById('createModal').classList.add('active');
+        }
+
+        function hideCreateModal() {
+            document.getElementById('createModal').classList.remove('active');
+            document.getElementById('createForm').reset();
+        }
+
+        function createTask(event) {
+            event.preventDefault();
+            const data = {
+                idc: document.getElementById('idc').value,
+                sn: document.getElementById('sn').value,
+                mac: document.getElementById('mac').value,
+                os_type: document.getElementById('os_type').value,
+                os_version: document.getElementById('os_version').value
+            };
+
+            fetch('/api/v1/tasks', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            })
+            .then(r => r.json())
+            .then(result => {
+                alert('任务创建成功！任务ID: ' + result.task_id);
+                hideCreateModal();
+                loadTasks();
+            });
+        }
+
+        function approveTask(idc, sn) {
+            fetch(`/api/v1/tasks/${idc}/${sn}/approve`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ notes: '审批通过' })
+            }).then(() => loadTasks());
+        }
+
+        function rejectTask(idc, sn) {
+            const reason = prompt('请输入拒绝原因:');
+            if (reason) {
+                fetch(`/api/v1/tasks/${idc}/${sn}/reject`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ reason })
+                }).then(() => loadTasks());
+            }
+        }
+
+        function refreshTasks() { loadTasks(); }
+
+        function getStatusText(status) {
+            return { 'pending': '待审批', 'approved': '已审批', 'installing': '安装中', 'completed': '已完成', 'failed': '失败' }[status] || status;
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            connectWebSocket();
+            loadTasks();
+            setInterval(loadTasks, 30000);
+        });
+
+        document.getElementById('createModal').addEventListener('click', (e) => {
+            if (e.target.id === 'createModal') hideCreateModal();
+        });
+    </script>
+</body>
+</html>
