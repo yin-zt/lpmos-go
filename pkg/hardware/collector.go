@@ -321,7 +321,10 @@ func (c *Collector) collectBIOS() (models.BIOSInfo, error) {
 	}
 
 	// Get serial number from system info
-	cmd = exec.Command("dmidecode", "-s", "system-serial-number")
+	// Use awk to get only the first field to handle VMware VMs with spaces in serial number
+	// Example: "VMware-56 4d f9 07..." becomes "VMware-56"
+	// Physical servers have continuous serial numbers without spaces, so they remain unchanged
+	cmd = exec.Command("sh", "-c", "dmidecode -s system-serial-number | awk '{print $1}'")
 	output, err = cmd.CombinedOutput()
 	if err == nil {
 		biosInfo.Serial = strings.TrimSpace(string(output))

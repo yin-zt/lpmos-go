@@ -258,6 +258,9 @@ type TaskV3 struct {
 	// Approval info (embedded)
 	Approval *Approval `json:"approval,omitempty"`
 
+	// PXE configuration flag
+	PXEConfigured bool `json:"pxe_configured,omitempty"`
+
 	// Metadata
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -303,4 +306,70 @@ type AgentProgressRequestV3 struct {
 	Percent    int                    `json:"percent" binding:"required"`
 	Message    string                 `json:"message"`
 	Details    map[string]interface{} `json:"details,omitempty"`
+}
+
+// ========== OS Installation Configuration ==========
+
+// InstallMethod represents the installation method
+type InstallMethod string
+
+const (
+	InstallMethodKickstart   InstallMethod = "kickstart"   // Use Kickstart/Preseed
+	InstallMethodAgentDirect InstallMethod = "agent_direct" // Agent直接安装
+)
+
+// OSInstallConfig represents OS installation configuration
+type OSInstallConfig struct {
+	Method        InstallMethod      `json:"install_method"`
+	OSType        string             `json:"os_type"`
+	OSVersion     string             `json:"os_version"`
+	MirrorURL     string             `json:"mirror_url,omitempty"`
+	RegionalURL   string             `json:"regional_url,omitempty"`       // Regional Client API base URL
+	KickstartURL  string             `json:"kickstart_url,omitempty"`      // For kickstart method
+	DiskLayout    DiskLayoutConfig   `json:"disk_layout,omitempty"`        // For agent_direct method
+	Network       NetworkConfig      `json:"network"`
+	Packages      []string           `json:"packages,omitempty"`
+	PostScript    string             `json:"post_install_script,omitempty"` // Base64 encoded
+	RootPassword  string             `json:"root_password,omitempty"`       // Encrypted
+}
+
+// DiskLayoutConfig represents disk partition layout
+type DiskLayoutConfig struct {
+	RootDisk       string              `json:"root_disk"`       // /dev/sda
+	PartitionTable string              `json:"partition_table"` // gpt or msdos
+	Partitions     []PartitionConfig   `json:"partitions"`
+}
+
+// PartitionConfig represents a single partition
+type PartitionConfig struct {
+	MountPoint string `json:"mount_point"` // /, /boot, /home, swap
+	Size       string `json:"size"`        // 10G, 100G, 0 (remaining space)
+	FSType     string `json:"fstype"`      // ext4, xfs, swap
+}
+
+// NetworkConfig represents network configuration
+type NetworkConfig struct {
+	Interface string `json:"interface"` // eth0, ens33
+	Method    string `json:"method"`    // static or dhcp
+	IP        string `json:"ip,omitempty"`
+	Netmask   string `json:"netmask,omitempty"`
+	Gateway   string `json:"gateway,omitempty"`
+	DNS       string `json:"dns,omitempty"`
+	Hostname  string `json:"hostname"`
+}
+
+// RAIDConfig represents RAID configuration
+type RAIDConfig struct {
+	Enabled    bool     `json:"enabled"`
+	Level      string   `json:"level"`       // 0, 1, 5, 6, 10
+	Disks      []string `json:"disks"`       // ["/dev/sdb", "/dev/sdc"]
+	Controller string   `json:"controller"`  // megacli, hpacucli, mdadm
+	VirtualDisk string  `json:"virtual_disk,omitempty"` // /dev/sda (after RAID)
+}
+
+// HardwareConfig represents hardware configuration operation
+type HardwareConfig struct {
+	RAID         *RAIDConfig            `json:"raid,omitempty"`
+	BIOS         map[string]string      `json:"bios,omitempty"`
+	CustomScript string                 `json:"custom_script,omitempty"` // Base64 encoded
 }

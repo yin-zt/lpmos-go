@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yourusername/lpmos-go/cmd/regional-client/dhcp"
+	"github.com/lpmos/lpmos-go/cmd/regional-client/dhcp"
 )
 
 func main() {
@@ -16,16 +16,16 @@ func main() {
 
 	// 1. 创建 DHCP 服务器配置
 	config := dhcp.Config{
-		Interface:  "eth1",                            // 网卡接口名称
-		ServerIP:   "192.168.100.1",                   // DHCP 服务器 IP
-		Gateway:    "192.168.100.1",                   // 网关地址
+		Interface:  "eth1",                               // 网卡接口名称
+		ServerIP:   "192.168.100.1",                      // DHCP 服务器 IP
+		Gateway:    "192.168.100.1",                      // 网关地址
 		DNSServers: []string{"192.168.100.1", "8.8.8.8"}, // DNS 服务器列表
-		TFTPServer: "192.168.100.1",                   // TFTP 服务器地址
-		BootFile:   "pxelinux.0",                      // PXE 启动文件
-		LeaseTime:  3600 * time.Second,                // 租约时间: 1 小时
-		StartIP:    "192.168.100.10",                  // IP 池起始地址
-		EndIP:      "192.168.100.200",                 // IP 池结束地址
-		Netmask:    "255.255.255.0",                   // 子网掩码
+		TFTPServer: "192.168.100.1",                      // TFTP 服务器地址
+		BootFile:   "pxelinux.0",                         // PXE 启动文件
+		LeaseTime:  3600 * time.Second,                   // 租约时间: 1 小时
+		StartIP:    "192.168.100.10",                     // IP 池起始地址
+		EndIP:      "192.168.100.200",                    // IP 池结束地址
+		Netmask:    "255.255.255.0",                      // 子网掩码
 	}
 
 	// 2. 创建 DHCP 服务器
@@ -40,10 +40,10 @@ func main() {
 
 	// 绑定 1: Ubuntu 服务器
 	err = server.AddStaticBinding(
-		"00:1a:2b:3c:4d:5e",           // MAC 地址
-		"192.168.100.10",              // 固定 IP
-		"ubuntu-server-01",            // 主机名
-		"pxelinux.0",                  // 启动文件
+		"00:1a:2b:3c:4d:5e", // MAC 地址
+		"192.168.100.10",    // 固定 IP
+		"ubuntu-server-01",  // 主机名
+		"pxelinux.0",        // 启动文件
 	)
 	if err != nil {
 		log.Printf("Failed to add binding: %v", err)

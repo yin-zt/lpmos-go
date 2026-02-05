@@ -89,8 +89,15 @@ func (g *Generator) GenerateConfig(bc *BootConfig) error {
 }
 
 // GenerateDefaultConfig generates a default PXE configuration
+// Only creates the file if it doesn't already exist (preserves user customizations)
 func (g *Generator) GenerateDefaultConfig() error {
 	defaultConfigPath := filepath.Join(g.configDir, "default")
+
+	// Check if default config already exists
+	if _, err := os.Stat(defaultConfigPath); err == nil {
+		// File exists, don't overwrite it
+		return nil
+	}
 
 	defaultContent := `DEFAULT menu.c32
 PROMPT 0

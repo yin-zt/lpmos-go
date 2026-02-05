@@ -1,4 +1,4 @@
-.PHONY: build run clean start-etcd stop-etcd demo help
+.PHONY: build run clean start-etcd stop-etcd demo help linux linux-all mac
 
 # Variables
 BINARY_DIR=bin
@@ -6,12 +6,96 @@ CONTROL_PLANE_BINARY=$(BINARY_DIR)/control-plane
 REGIONAL_CLIENT_BINARY=$(BINARY_DIR)/regional-client
 AGENT_BINARY=$(BINARY_DIR)/agent-minimal
 
+# Linux AMD64 binaries (生产环境)
+CONTROL_PLANE_LINUX=$(BINARY_DIR)/control-plane-linux-amd64
+REGIONAL_CLIENT_LINUX=$(BINARY_DIR)/regional-client-linux-amd64
+AGENT_LINUX=$(BINARY_DIR)/agent-minimal-linux-amd64
+
+# macOS ARM64 binaries (本地测试)
+CONTROL_PLANE_MAC=$(BINARY_DIR)/control-plane-darwin-arm64
+REGIONAL_CLIENT_MAC=$(BINARY_DIR)/regional-client-darwin-arm64
+AGENT_MAC=$(BINARY_DIR)/agent-minimal-darwin-arm64
+
 # Go parameters
 GOCMD=go
 GOBUILD=$(GOCMD) build
 GOCLEAN=$(GOCMD) clean
 GOTEST=$(GOCMD) test
 GOMOD=$(GOCMD) mod
+
+# Build flags
+LDFLAGS=-ldflags="-s -w"
+
+# Build flags
+LDFLAGS=-ldflags="-s -w"
+
+# ============================================================================
+# Linux AMD64 编译目标 (生产环境 - 交叉编译)
+# ============================================================================
+
+# 编译所有 Linux AMD64 可执行文件
+linux-all: linux-control-plane linux-regional-client linux-agent
+	@echo "✅ 所有 Linux AMD64 组件编译完成"
+
+# 简化的 linux 目标 (常用)
+linux: linux-regional-client linux-agent
+	@echo "✅ Linux AMD64 主要组件编译完成"
+
+# Linux Control Plane
+linux-control-plane:
+	@echo "构建 Control Plane (Linux AMD64)..."
+	@mkdir -p $(BINARY_DIR)
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(CONTROL_PLANE_LINUX) cmd/control-plane/main.go
+	@echo "✅ Control Plane (Linux) 构建完成: $(CONTROL_PLANE_LINUX)"
+
+# Linux Regional Client
+linux-regional-client:
+	@echo "构建 Regional Client (Linux AMD64)..."
+	@mkdir -p $(BINARY_DIR)
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(REGIONAL_CLIENT_LINUX) cmd/regional-client/main.go
+	@echo "✅ Regional Client (Linux) 构建完成: $(REGIONAL_CLIENT_LINUX)"
+
+# Linux Agent
+linux-agent:
+	@echo "构建 Agent (Linux AMD64)..."
+	@mkdir -p $(BINARY_DIR)
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(AGENT_LINUX) cmd/agent-minimal/main.go
+	@echo "✅ Agent (Linux) 构建完成: $(AGENT_LINUX)"
+	@ls -lh $(AGENT_LINUX)
+
+# ============================================================================
+# macOS ARM64 编译目标 (本地测试)
+# ============================================================================
+
+# 编译所有 macOS ARM64 可执行文件
+mac: mac-control-plane mac-regional-client mac-agent
+	@echo "✅ 所有 macOS ARM64 组件编译完成"
+
+# macOS Control Plane
+mac-control-plane:
+	@echo "构建 Control Plane (macOS ARM64)..."
+	@mkdir -p $(BINARY_DIR)
+	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(CONTROL_PLANE_MAC) cmd/control-plane/main.go
+	@echo "✅ Control Plane (macOS) 构建完成: $(CONTROL_PLANE_MAC)"
+
+# macOS Regional Client
+mac-regional-client:
+	@echo "构建 Regional Client (macOS ARM64)..."
+	@mkdir -p $(BINARY_DIR)
+	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(REGIONAL_CLIENT_MAC) cmd/regional-client/main.go
+	@echo "✅ Regional Client (macOS) 构建完成: $(REGIONAL_CLIENT_MAC)"
+
+# macOS Agent
+mac-agent:
+	@echo "构建 Agent (macOS ARM64)..."
+	@mkdir -p $(BINARY_DIR)
+	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GOBUILD) $(LDFLAGS) -o $(AGENT_MAC) cmd/agent-minimal/main.go
+	@echo "✅ Agent (macOS) 构建完成: $(AGENT_MAC)"
+	@ls -lh $(AGENT_MAC)
+
+# ============================================================================
+# 兼容旧版构建命令 (使用当前平台设置)
+# ============================================================================
 
 # Build all binaries
 build: build-control-plane build-regional-client build-agent
@@ -145,17 +229,44 @@ fmt:
 	@echo "格式化代码..."
 	$(GOCMD) fmt ./...
 
+
+clean-mac:
+	@echo "清理 macOS ARM64 构建产物..."
+	rm -f $(BINARY_DIR)/control-plane-darwin-arm64
+	rm -f $(BINARY_DIR)/regional-client-darwin-arm64
+	rm -f $(BINARY_DIR)/agent-minimal-darwin-arm64
+	@echo "✅ macOS ARM64 构建产物清理完成"
+
+clean-linux:
+	@echo "清理 Linux AMD64 构建产物..."
+	rm -f $(BINARY_DIR)/control-plane-linux-amd64
+	rm -f $(BINARY_DIR)/regional-client-linux-amd64
+	rm -f $(BINARY_DIR)/agent-minimal-linux-amd64
+	@echo "✅ Linux AMD64 构建产物清理完成"
 # Help
 help:
 	@echo "LPMOS 装机管理平台 - Makefile 命令"
 	@echo ""
-	@echo "构建命令:"
-	@echo "  make build              - 构建所有组件"
+	@echo "==================== 生产环境编译 (Linux AMD64) ===================="
+	@echo "  make linux              - 编译 Regional Client + Agent (Linux AMD64)"
+	@echo "  make linux-all          - 编译所有组件 (Linux AMD64)"
+	@echo "  make linux-control-plane - 编译 Control Plane (Linux AMD64)"
+	@echo "  make linux-regional-client - 编译 Regional Client (Linux AMD64)"
+	@echo "  make linux-agent        - 编译 Agent (Linux AMD64)"
+	@echo ""
+	@echo "==================== 本地测试编译 (macOS ARM64) ===================="
+	@echo "  make mac                - 编译所有组件 (macOS ARM64)"
+	@echo "  make mac-control-plane  - 编译 Control Plane (macOS ARM64)"
+	@echo "  make mac-regional-client - 编译 Regional Client (macOS ARM64)"
+	@echo "  make mac-agent          - 编译 Agent (macOS ARM64)"
+	@echo ""
+	@echo "==================== 兼容旧版构建命令 ===================="
+	@echo "  make build              - 构建所有组件 (使用当前系统设置)"
 	@echo "  make build-control-plane - 构建 Control Plane"
 	@echo "  make build-regional-client - 构建 Regional Client"
 	@echo "  make build-agent        - 构建 Agent"
 	@echo ""
-	@echo "运行命令:"
+	@echo "==================== 运行命令 ===================="
 	@echo "  make run                - 启动 Control Plane (端口8080)"
 	@echo "  make run-regional       - 启动 Regional Client DC1 (端口8081)"
 	@echo "  make run-regional-full  - 启动 Regional Client DC1 with DHCP+TFTP+PXE (需要root)"
@@ -163,17 +274,21 @@ help:
 	@echo "  make run-regional-dc2-full - 启动 Regional Client DC2 with DHCP+TFTP+PXE (需要root)"
 	@echo "  make run-agent          - 启动 Agent"
 	@echo ""
-	@echo "环境命令:"
+	@echo "==================== 环境命令 ===================="
 	@echo "  make start-etcd         - 启动 etcd"
 	@echo "  make stop-etcd          - 停止 etcd"
 	@echo "  make demo               - 一键启动Demo环境"
 	@echo ""
-	@echo "其他命令:"
+	@echo "==================== 其他命令 ===================="
 	@echo "  make clean              - 清理构建产物"
 	@echo "  make deps               - 下载依赖"
 	@echo "  make test               - 运行测试"
 	@echo "  make fmt                - 格式化代码"
 	@echo ""
+	@echo "💡 生产环境编译: make linux"
+	@echo "💡 本地测试: make mac"
 	@echo "💡 快速开始: make demo"
 	@echo "💡 完整PXE环境: make run-regional-full"
+	@echo ""
+	@echo "⚠️  注意: 交叉编译使用环境变量，不会修改全局 go env 设置"
 	@echo ""

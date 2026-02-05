@@ -75,6 +75,12 @@ func (c *Client) Close() error {
 	return nil
 }
 
+// GetClient returns the underlying etcd client
+// Use with caution - only for operations not wrapped by this client
+func (c *Client) GetClient() *clientv3.Client {
+	return c.cli
+}
+
 // Put stores a value in etcd with automatic context timeout
 func (c *Client) Put(key string, value interface{}) error {
 	ctx, cancel := context.WithTimeout(context.Background(), c.requestTimeout)

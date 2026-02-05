@@ -16,6 +16,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/lpmos/lpmos-go/cmd/agent-minimal/install"
+	"github.com/lpmos/lpmos-go/cmd/agent-minimal/kickstart"
+	"github.com/lpmos/lpmos-go/cmd/agent-minimal/raid"
 )
 
 // HardwareInfo contains collected hardware information
@@ -114,9 +118,19 @@ type HardwareScript struct {
 	Script string `json:"script"` // base64 encoded
 }
 
+// RAIDConfig represents RAID configuration
+type RAIDConfig struct {
+	Enabled     bool     `json:"enabled"`
+	Level       string   `json:"level"`
+	Disks       []string `json:"disks"`
+	Controller  string   `json:"controller"`
+	VirtualDisk string   `json:"virtual_disk"`
+}
+
 // HardwareConfigResponse represents response with hardware config scripts
 type HardwareConfigResponse struct {
 	Scripts []HardwareScript `json:"scripts"`
+	RAID    *RAIDConfig      `json:"raid,omitempty"`
 }
 
 // OperationCompleteRequest represents operation completion report
@@ -316,23 +330,36 @@ func detectVirtualMachine() bool {
 // getSerialNumber retrieves system serial number from multiple sources
 func getSerialNumber() string {
 	// Try DMI product serial
+	// Use only the first field to handle VMware VMs with spaces in serial number
 	if data, err := os.ReadFile("/sys/class/dmi/id/product_serial"); err == nil {
 		serial := strings.TrimSpace(string(data))
+		// Extract only the first field (space-separated)
+		if fields := strings.Fields(serial); len(fields) > 0 {
+			serial = fields[0]
+		}
 		if serial != "" && serial != "Not Specified" && serial != "To Be Filled By O.E.M." && serial != "Default string" {
 			return serial
 		}
 	}
 
 	// Try DMI board serial
+	// Use only the first field to handle VMware VMs with spaces in serial number
 	if data, err := os.ReadFile("/sys/class/dmi/id/board_serial"); err == nil {
 		serial := strings.TrimSpace(string(data))
+		// Extract only the first field (space-separated)
+		if fields := strings.Fields(serial); len(fields) > 0 {
+			serial = fields[0]
+		}
 		if serial != "" && serial != "Not Specified" && serial != "To Be Filled By O.E.M." && serial != "Default string" {
 			return serial
 		}
 	}
 
 	// Try dmidecode command (requires root)
-	cmd := exec.Command("dmidecode", "-s", "system-serial-number")
+	// Use awk to get only the first field to handle VMware VMs with spaces in serial number
+	// Example: "VMware-56 4d f9 07..." becomes "VMware-56"
+	// Physical servers have continuous serial numbers without spaces, so they remain unchanged
+	cmd := exec.Command("sh", "-c", "dmidecode -s system-serial-number | awk '{print $1}'")
 	if output, err := cmd.Output(); err == nil {
 		serial := strings.TrimSpace(string(output))
 		if serial != "" && serial != "Not Specified" && serial != "To Be Filled By O.E.M." && serial != "Default string" {
@@ -640,17 +667,27 @@ func pollInstallQueue() error {
 	maxAttempts := 120 // 20 minutes with 10-second intervals
 	attempt := 0
 
+	client := &http.Client{
+		Timeout: 5 * time.Second, // 建议 3~10 秒
+	}
+
 	for attempt < maxAttempts {
 		attempt++
 		log.Printf("  Polling install queue (attempt %d/%d)...", attempt, maxAttempts)
 
+		log.Printf("  Serial number: %s", serialNumber)
 		req := InstallQueueRequest{SN: serialNumber}
 		data, err := json.Marshal(req)
+		log.Printf("  Request data: %s", string(data))
+		log.Printf("  URL: %s", url)
+		log.Printf("  Error: %v", err)
 		if err != nil {
 			return fmt.Errorf("failed to marshal request: %w", err)
 		}
 
-		resp, err := http.Post(url, "application/json", bytes.NewBuffer(data))
+		resp, err := client.Post(url, "application/json", bytes.NewBuffer(data))
+		log.Printf("  Response: %+v", resp)
+		log.Printf("  Error: %v", err)
 		if err != nil {
 			log.Printf("  Network error: %v, retrying in %v", err, pollingInterval)
 			time.Sleep(pollingInterval)
@@ -667,7 +704,7 @@ func pollInstallQueue() error {
 				time.Sleep(pollingInterval)
 				continue
 			}
-
+			log.Printf("  Queue response: %+v", queueResp)
 			if queueResp.Result {
 				log.Printf("  Machine is in install queue!")
 				return nil
@@ -718,7 +755,7 @@ func operationLoop() error {
 				return err
 			}
 			reportOperationComplete("network_config", true, "Network config completed")
- 
+
 		case "os_install":
 			if err := executeOSInstall(nextOp.Data); err != nil {
 				log.Printf("  OS install failed: %v", err)
@@ -783,7 +820,7 @@ func getNextOperation() (*NextOperationResponse, error) {
 func executeHardwareConfig() error {
 	log.Println("  Executing hardware configuration...")
 
-	// Get hardware config scripts from server
+	// Get hardware config from server
 	url := regionalClientURL + "/api/v1/device/getHardwareConfig"
 
 	req := HardwareConfigRequest{SN: serialNumber}
@@ -809,9 +846,34 @@ func executeHardwareConfig() error {
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
 
+	// Check if RAID configuration is present in data
+	if hwConfig.RAID != nil && hwConfig.RAID.Enabled {
+		log.Println("  RAID configuration detected, configuring RAID...")
+
+		raidConfig := &raid.Config{
+			Enabled:     hwConfig.RAID.Enabled,
+			Level:       hwConfig.RAID.Level,
+			Disks:       hwConfig.RAID.Disks,
+			Controller:  hwConfig.RAID.Controller,
+			VirtualDisk: hwConfig.RAID.VirtualDisk,
+		}
+
+		configurator := raid.NewConfigurator(raidConfig)
+		if err := configurator.Configure(); err != nil {
+			return fmt.Errorf("RAID configuration failed: %w", err)
+		}
+
+		// Verify RAID configuration
+		if err := configurator.Verify(); err != nil {
+			log.Printf("Warning: RAID verification failed: %v", err)
+		}
+
+		log.Println("  RAID configuration completed successfully")
+	}
+
+	// Execute custom scripts if present
 	log.Printf("  Received %d hardware config script(s)", len(hwConfig.Scripts))
 
-	// Execute each script
 	for i, script := range hwConfig.Scripts {
 		log.Printf("  [%d/%d] Executing script: %s", i+1, len(hwConfig.Scripts), script.Name)
 
@@ -884,33 +946,91 @@ func executeNetworkConfig(data map[string]interface{}) error {
 // executeOSInstall performs OS installation
 func executeOSInstall(data map[string]interface{}) error {
 	log.Println("  Executing OS installation...")
-	log.Printf("  OS install data: %+v", data)
 
-	// Extract OS information from data
+	// Extract installation method
+	installMethod, ok := data["install_method"].(string)
+	if !ok {
+		installMethod = "agent_direct" // Default
+	}
+
+	log.Printf("  Installation method: %s", installMethod)
+
+	switch installMethod {
+	case "kickstart":
+		return executeKickstartInstall(data)
+	case "agent_direct":
+		return executeAgentDirectInstall(data)
+	default:
+		return fmt.Errorf("unknown installation method: %s", installMethod)
+	}
+}
+
+// executeKickstartInstall performs kickstart-based installation
+func executeKickstartInstall(data map[string]interface{}) error {
+	log.Println("  Using kickstart installation method...")
+
+	// Extract kickstart URL
+	kickstartURL, ok := data["kickstart_url"].(string)
+	if !ok || kickstartURL == "" {
+		return fmt.Errorf("kickstart_url not provided")
+	}
+
 	osType, _ := data["os_type"].(string)
 	osVersion, _ := data["os_version"].(string)
 
-	log.Printf("  Installing: %s %s", osType, osVersion)
+	log.Printf("  Kickstart URL: %s", kickstartURL)
 
-	// Simulate installation stages
-	stages := []struct {
-		name    string
-		message string
-		delay   time.Duration
-	}{
-		{"partitioning", "Creating disk partitions", 2 * time.Second},
-		{"downloading", "Downloading OS image", 3 * time.Second},
-		{"installing", "Installing base system", 3 * time.Second},
-		{"configuring", "Configuring system", 2 * time.Second},
-		{"finalizing", "Finalizing installation", 2 * time.Second},
+	// Create kickstart installer
+	ksConfig := &kickstart.Config{
+		KickstartURL: kickstartURL,
+		OSType:       osType,
+		OSVersion:    osVersion,
 	}
 
-	for _, stage := range stages {
-		log.Printf("    [%s] %s...", stage.name, stage.message)
-		time.Sleep(stage.delay)
+	installer := kickstart.NewInstaller(ksConfig)
+
+	// Verify kickstart (optional)
+	// installer.Verify()
+
+	// Perform installation (will reboot system via kexec)
+	if err := installer.Install(); err != nil {
+		return fmt.Errorf("kickstart installation failed: %w", err)
 	}
 
-	log.Println("  OS installation completed")
+	// If we reach here, kexec should have rebooted the system
+	// This code should not execute
+	log.Println("  System should have rebooted via kexec")
+	return nil
+}
+
+// executeAgentDirectInstall performs agent direct installation
+func executeAgentDirectInstall(data map[string]interface{}) error {
+	log.Println("  Using agent direct installation method...")
+
+	// Convert map to JSON and back to install.Config
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("failed to marshal install config: %w", err)
+	}
+
+	var installConfig install.Config
+	if err := json.Unmarshal(jsonData, &installConfig); err != nil {
+		return fmt.Errorf("failed to unmarshal install config: %w", err)
+	}
+
+	log.Printf("  Installing: %s %s", installConfig.OSType, installConfig.OSVersion)
+	log.Printf("  Disk: %s", installConfig.DiskLayout.RootDisk)
+	log.Printf("  Partitions: %d", len(installConfig.DiskLayout.Partitions))
+
+	// Create installer
+	installer := install.NewInstaller(&installConfig)
+
+	// Perform installation
+	if err := installer.Install(); err != nil {
+		return fmt.Errorf("agent direct installation failed: %w", err)
+	}
+
+	log.Println("  Agent direct installation completed successfully")
 	return nil
 }
 

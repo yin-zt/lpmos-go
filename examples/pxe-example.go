@@ -5,7 +5,7 @@ import (
 	"log"
 	"net"
 
-	"github.com/yourusername/lpmos-go/cmd/regional-client/pxe"
+	"github.com/lpmos/lpmos-go/cmd/regional-client/pxe"
 )
 
 func main() {

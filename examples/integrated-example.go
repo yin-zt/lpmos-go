@@ -9,9 +9,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yourusername/lpmos-go/cmd/regional-client/dhcp"
-	"github.com/yourusername/lpmos-go/cmd/regional-client/pxe"
-	"github.com/yourusername/lpmos-go/cmd/regional-client/tftp"
+	"github.com/lpmos/lpmos-go/cmd/regional-client/dhcp"
+	"github.com/lpmos/lpmos-go/cmd/regional-client/pxe"
+	"github.com/lpmos/lpmos-go/cmd/regional-client/tftp"
 )
 
 func main() {

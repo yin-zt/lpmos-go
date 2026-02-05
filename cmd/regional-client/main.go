@@ -17,6 +17,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 
 	"github.com/lpmos/lpmos-go/cmd/regional-client/dhcp"
+	"github.com/lpmos/lpmos-go/cmd/regional-client/kickstart"
 	"github.com/lpmos/lpmos-go/cmd/regional-client/pxe"
 	"github.com/lpmos/lpmos-go/cmd/regional-client/tftp"
 	"github.com/lpmos/lpmos-go/pkg/etcd"
@@ -32,13 +33,22 @@ type RegionalClient struct {
 	leases     map[string]clientv3.LeaseID // sn -> leaseID mapping
 
 	// PXE infrastructure
-	dhcpServer   *dhcp.Server
-	tftpServer   *tftp.Server
-	pxeGenerator *pxe.Generator
+	dhcpServer         *dhcp.Server
+	tftpServer         *tftp.Server
+	pxeGenerator       *pxe.Generator
+	kickstartGenerator *kickstart.Generator
 
 	// Configuration
 	serverIP     string
 	networkIface string
+	apiPort      string
+	enableDHCP   bool
+	enableTFTP   bool
+	startedAt    time.Time
+	staticRoot   string // Root directory for static files
+
+	// Self registration
+	selfLeaseID clientv3.LeaseID
 }
 
 func main() {
@@ -52,6 +62,7 @@ func main() {
 	enableTFTP := false
 	serverIP := "192.168.100.1"
 	networkIface := "eth1"
+	staticRoot := "/tftpboot" // Root directory for static files
 
 	for _, arg := range os.Args[1:] {
 		if strings.HasPrefix(arg, "--idc=") {
@@ -72,6 +83,9 @@ func main() {
 		if strings.HasPrefix(arg, "--interface=") {
 			networkIface = strings.TrimPrefix(arg, "--interface=")
 		}
+		if strings.HasPrefix(arg, "--static-root=") {
+			staticRoot = strings.TrimPrefix(arg, "--static-root=")
+		}
 	}
 
 	if idc == "" {
@@ -79,7 +93,7 @@ func main() {
 	}
 
 	log.Printf("Starting LPMOS Regional Client v3.0 for IDC: %s", idc)
-	log.Printf("Configuration: API Port=%s, Server IP=%s, Interface=%s", apiPort, serverIP, networkIface)
+	log.Printf("Configuration: API Port=%s, Server IP=%s, Interface=%s, Static Root=%s", apiPort, serverIP, networkIface, staticRoot)
 
 	// Initialize etcd client
 	etcdClient, err := etcd.NewClient(etcd.Config{
@@ -95,14 +109,34 @@ func main() {
 	// Create regional client
 	ctx, cancel := context.WithCancel(context.Background())
 	rc := &RegionalClient{
-		idc:          idc,
-		etcdClient:   etcdClient,
-		ctx:          ctx,
-		cancel:       cancel,
-		leases:       make(map[string]clientv3.LeaseID),
-		serverIP:     serverIP,
-		networkIface: networkIface,
+		idc:                idc,
+		etcdClient:         etcdClient,
+		ctx:                ctx,
+		cancel:             cancel,
+		leases:             make(map[string]clientv3.LeaseID),
+		serverIP:           serverIP,
+		networkIface:       networkIface,
+		apiPort:            apiPort,
+		enableDHCP:         enableDHCP,
+		enableTFTP:         enableTFTP,
+		startedAt:          time.Now(),
+		staticRoot:         staticRoot,
+		kickstartGenerator: kickstart.NewGenerator(),
 	}
+
+	log.Println("✓ Kickstart/Preseed generator initialized")
+
+	// Ensure static file directories exist
+	if err := rc.ensureStaticDirectories(); err != nil {
+		log.Fatalf("Failed to create static directories: %v", err)
+	}
+	log.Printf("✓ Static file directories ready: %s", staticRoot)
+
+	// Register Regional Client to etcd
+	if err := rc.registerToEtcd(); err != nil {
+		log.Fatalf("Failed to register to etcd: %v", err)
+	}
+	log.Printf("✓ Regional Client registered to etcd: /os/region/%s", idc)
 
 	// Initialize TFTP server if enabled
 	if enableTFTP {
@@ -153,6 +187,9 @@ func main() {
 
 	log.Println("Shutting down regional client...")
 
+	// Unregister from etcd
+	rc.unregisterFromEtcd()
+
 	// Stop DHCP server
 	if rc.dhcpServer != nil {
 		log.Println("Stopping DHCP server...")
@@ -186,8 +223,14 @@ func setupRouter(rc *RegionalClient) *gin.Engine {
 			device.POST("/isInInstallQueue", rc.isInInstallQueue)
 			device.POST("/getNextOperation", rc.getNextOperation)
 			device.POST("/getHardwareConfig", rc.getHardwareConfig)
+			device.POST("/getOSInstallConfig", rc.getOSInstallConfig)
 			device.POST("/operationComplete", rc.operationComplete)
+			device.POST("/installComplete", rc.installComplete)
 		}
+
+		// Kickstart/Preseed endpoints
+		api.GET("/kickstart/:sn", rc.generateKickstart)
+		api.GET("/preseed/:sn", rc.generatePreseed)
 
 		// PXE infrastructure management endpoints
 		pxe := api.Group("/pxe")
@@ -219,12 +262,38 @@ func setupRouter(rc *RegionalClient) *gin.Engine {
 		c.JSON(http.StatusOK, status)
 	})
 
+	// Static files for HTTP download (kernel, initramfs, repos, etc.)
+	staticDir := rc.staticRoot + "/static"
+	reposDir := rc.staticRoot + "/repos"
+
+	router.Static("/static", staticDir)
+	router.Static("/repos", reposDir)
+
+	// File listing endpoints (for debugging and verification)
+	api.GET("/files/static", func(c *gin.Context) {
+		files, err := listDirectory(staticDir, "")
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"path": "/static", "files": files})
+	})
+
+	api.GET("/files/repos", func(c *gin.Context) {
+		files, err := listDirectory(reposDir, "")
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"path": "/repos", "files": files})
+	})
+
 	return router
 }
 
 // initTFTP initializes and starts the TFTP server
 func (rc *RegionalClient) initTFTP() error {
-	tftpRoot := "/tftpboot"
+	tftpRoot := rc.staticRoot
 
 	// Create file manager and ensure directories exist
 	fileManager := tftp.NewFileManager(tftpRoot)
@@ -258,7 +327,7 @@ func (rc *RegionalClient) initTFTP() error {
 // initPXE initializes the PXE configuration generator
 func (rc *RegionalClient) initPXE() error {
 	generator, err := pxe.NewGenerator(pxe.Config{
-		TFTPRoot: "/tftpboot",
+		TFTPRoot: rc.staticRoot,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create PXE generator: %w", err)
@@ -283,7 +352,7 @@ func (rc *RegionalClient) initDHCP() error {
 		DNSServers: []string{rc.serverIP, "8.8.8.8"},
 		TFTPServer: rc.serverIP,
 		BootFile:   "pxelinux.0",
-		LeaseTime:  3600 * time.Second, // 1 hour
+		LeaseTime:  24 * 3600 * time.Second, // 24 hours (extended for installation)
 		StartIP:    rc.serverIP[:strings.LastIndex(rc.serverIP, ".")] + ".10",
 		EndIP:      rc.serverIP[:strings.LastIndex(rc.serverIP, ".")] + ".200",
 		Netmask:    "255.255.255.0",
@@ -338,9 +407,9 @@ func (rc *RegionalClient) configurePXEBoot(task *models.TaskV3) {
 			Hostname:     task.Hostname,
 			OSType:       task.OSType,
 			OSVersion:    task.OSVersion,
-			KernelPath:   fmt.Sprintf("/kernels/%s-%s-vmlinuz", task.OSType, task.OSVersion),
-			InitrdPath:   fmt.Sprintf("/initrds/%s-%s-initrd.img", task.OSType, task.OSVersion),
-			RegionalURL:  fmt.Sprintf("http://%s:8081", rc.serverIP),
+			KernelPath:   fmt.Sprintf("/static/kernels/vmlinuz-%s-%s", task.OSType, task.OSVersion),
+			InitrdPath:   fmt.Sprintf("/static/initramfs/initrd-%s-%s.img", task.OSType, task.OSVersion),
+			RegionalURL:  fmt.Sprintf("http://%s:8081/api/v1", rc.serverIP),
 			SerialNumber: task.SN,
 			DataCenter:   rc.idc,
 		}
@@ -349,8 +418,8 @@ func (rc *RegionalClient) configurePXEBoot(task *models.TaskV3) {
 			log.Printf("[%s] ERROR: Failed to generate PXE config for %s: %v", rc.idc, task.SN, err)
 			return
 		}
-		log.Printf("[%s] ✓ PXE configuration generated: /tftpboot/pxelinux.cfg/01-%s",
-			rc.idc, strings.ReplaceAll(strings.ToLower(task.MAC), ":", "-"))
+		log.Printf("[%s] ✓ PXE configuration generated: %s/pxelinux.cfg/01-%s",
+			rc.idc, rc.staticRoot, strings.ReplaceAll(strings.ToLower(task.MAC), ":", "-"))
 	}
 
 	// Step 3: Configure switch (TODO: Implement switch management module)
@@ -370,9 +439,10 @@ func (rc *RegionalClient) configurePXEBoot(task *models.TaskV3) {
 			return nil, err
 		}
 
-		t.Logs = append(t.Logs, fmt.Sprintf("[INFO] PXE boot environment configured"))
-		t.Logs = append(t.Logs, fmt.Sprintf("[INFO] DHCP binding: %s -> %s", task.MAC, task.IP))
-		t.Logs = append(t.Logs, fmt.Sprintf("[INFO] PXE config: 01-%s", strings.ReplaceAll(strings.ToLower(task.MAC), ":", "-")))
+		// Set PXE configured flag to prevent reconfiguration
+		t.PXEConfigured = true
+		// Don't add logs to etcd to prevent database bloat
+		// Logs are already written to Regional Client's log output
 		t.UpdatedAt = time.Now()
 
 		return t, nil
@@ -500,6 +570,231 @@ func (rc *RegionalClient) getPXEConfigs(c *gin.Context) {
 	})
 }
 
+// ensureStaticDirectories creates necessary directories for static files
+func (rc *RegionalClient) ensureStaticDirectories() error {
+	dirs := []string{
+		rc.staticRoot,
+		rc.staticRoot + "/static",
+		rc.staticRoot + "/static/kernels",
+		rc.staticRoot + "/static/initramfs",
+		rc.staticRoot + "/repos",
+		rc.staticRoot + "/repos/ubuntu",
+		rc.staticRoot + "/repos/centos",
+		rc.staticRoot + "/repos/rocky",
+		rc.staticRoot + "/repos/debian",
+	}
+
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", dir, err)
+		}
+	}
+
+	// Create README files
+	readmeContent := `# LPMOS Static Files Directory
+
+This directory contains static files served over HTTP for PXE boot and OS installation.
+
+## Directory Structure
+
+/static/
+  ├── kernels/          # Linux kernels (vmlinuz)
+  ├── initramfs/        # Initramfs images (lpmos-agent-initramfs.gz)
+  └── ...
+
+/repos/
+  ├── ubuntu/           # Ubuntu repository mirrors
+  │   ├── 20.04/
+  │   └── 22.04/
+  ├── centos/           # CentOS repository mirrors
+  │   ├── 7/
+  │   └── 8/
+  ├── rocky/            # Rocky Linux repository mirrors
+  │   ├── 8/
+  │   └── 9/
+  └── debian/           # Debian repository mirrors
+      ├── 11/
+      └── 12/
+
+## Usage
+
+Files are accessible via HTTP:
+- http://<server-ip>:8081/static/kernels/vmlinuz
+- http://<server-ip>:8081/static/initramfs/lpmos-agent-initramfs.gz
+- http://<server-ip>:8081/repos/ubuntu/22.04/...
+
+## File Listing API
+
+- GET /api/v1/files/static - List files in /static
+- GET /api/v1/files/repos  - List files in /repos
+`
+
+	readmePath := rc.staticRoot + "/README.md"
+	if err := os.WriteFile(readmePath, []byte(readmeContent), 0644); err != nil {
+		log.Printf("Warning: Failed to create README: %v", err)
+	}
+
+	return nil
+}
+
+// listDirectory recursively lists files in a directory
+func listDirectory(dir string, prefix string) ([]map[string]interface{}, error) {
+	var files []map[string]interface{}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, entry := range entries {
+		fullPath := dir + "/" + entry.Name()
+		relativePath := prefix + "/" + entry.Name()
+
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		fileInfo := map[string]interface{}{
+			"name":  entry.Name(),
+			"path":  relativePath,
+			"is_dir": entry.IsDir(),
+			"size":  info.Size(),
+		}
+
+		if !entry.IsDir() {
+			fileInfo["modified"] = info.ModTime().Format(time.RFC3339)
+		}
+
+		files = append(files, fileInfo)
+
+		// Recursively list subdirectories (limit depth to avoid too much data)
+		if entry.IsDir() && len(prefix) < 100 {
+			subFiles, err := listDirectory(fullPath, relativePath)
+			if err == nil {
+				files = append(files, subFiles...)
+			}
+		}
+	}
+
+	return files, nil
+}
+
+// registerToEtcd registers Regional Client to etcd with heartbeat
+func (rc *RegionalClient) registerToEtcd() error {
+	// Create Regional Client info
+	info := map[string]interface{}{
+		"idc":          rc.idc,
+		"server_ip":    rc.serverIP,
+		"api_port":     rc.apiPort,
+		"dhcp_enabled": rc.enableDHCP,
+		"tftp_enabled": rc.enableTFTP,
+		"started_at":   rc.startedAt.Format(time.RFC3339),
+		"status":       "online",
+	}
+
+	infoKey := fmt.Sprintf("/os/region/%s/info", rc.idc)
+	if err := rc.etcdClient.Put(infoKey, info); err != nil {
+		return fmt.Errorf("failed to put regional client info: %w", err)
+	}
+
+	// Start heartbeat
+	go rc.maintainHeartbeat()
+
+	return nil
+}
+
+// maintainHeartbeat maintains Regional Client heartbeat with lease
+func (rc *RegionalClient) maintainHeartbeat() {
+	heartbeatKey := fmt.Sprintf("/os/region/%s/heartbeat", rc.idc)
+
+	for {
+		// Create lease with 30s TTL
+		leaseID, keepAliveChan, err := rc.etcdClient.GrantLease(rc.ctx, 30)
+		if err != nil {
+			log.Printf("[%s] Failed to create heartbeat lease: %v", rc.idc, err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		rc.selfLeaseID = leaseID
+
+		// Put heartbeat key with lease
+		heartbeatValue := map[string]interface{}{
+			"status":       "online",
+			"last_updated": time.Now().Format(time.RFC3339),
+			"lease_id":     leaseID,
+		}
+
+		if err := rc.etcdClient.Put(heartbeatKey, heartbeatValue); err != nil {
+			log.Printf("[%s] Failed to put heartbeat: %v", rc.idc, err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		log.Printf("[%s] Heartbeat started (lease: %d)", rc.idc, leaseID)
+
+		// Keep-alive loop - continuously consume responses
+	keepAliveLoop:
+		for {
+			select {
+			case <-rc.ctx.Done():
+				log.Printf("[%s] Heartbeat stopped (context cancelled)", rc.idc)
+				return
+
+			case ka, ok := <-keepAliveChan:
+				if !ok {
+					// Channel closed, need to recreate lease
+					log.Printf("[%s] Heartbeat channel closed, recreating lease...", rc.idc)
+					break keepAliveLoop
+				}
+				if ka == nil {
+					// Keep-alive failed
+					log.Printf("[%s] Heartbeat keep-alive failed, recreating lease...", rc.idc)
+					break keepAliveLoop
+				}
+				// Successfully renewed, continue consuming
+			}
+		}
+
+		// Wait before recreating lease
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// unregisterFromEtcd removes Regional Client registration from etcd
+func (rc *RegionalClient) unregisterFromEtcd() {
+	log.Printf("[%s] Unregistering from etcd...", rc.idc)
+
+	// Update status to offline
+	infoKey := fmt.Sprintf("/os/region/%s/info", rc.idc)
+	info := map[string]interface{}{
+		"idc":          rc.idc,
+		"server_ip":    rc.serverIP,
+		"api_port":     rc.apiPort,
+		"dhcp_enabled": rc.enableDHCP,
+		"tftp_enabled": rc.enableTFTP,
+		"started_at":   rc.startedAt.Format(time.RFC3339),
+		"stopped_at":   time.Now().Format(time.RFC3339),
+		"status":       "offline",
+	}
+
+	if err := rc.etcdClient.Put(infoKey, info); err != nil {
+		log.Printf("[%s] Warning: Failed to update status to offline: %v", rc.idc, err)
+	}
+
+	// Revoke heartbeat lease (will delete heartbeat key)
+	if rc.selfLeaseID != 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := rc.etcdClient.GetClient().Revoke(ctx, rc.selfLeaseID); err != nil {
+			log.Printf("[%s] Warning: Failed to revoke heartbeat lease: %v", rc.idc, err)
+		}
+	}
+
+	log.Printf("[%s] Unregistered from etcd", rc.idc)
+}
+
 // watchServers watches for new servers (INDIVIDUAL KEYS v3.0)
 func (rc *RegionalClient) watchServers() {
 	prefix := etcd.ServerPrefix(rc.idc)
@@ -540,7 +835,8 @@ func (rc *RegionalClient) watchTasks() {
 			if event.Type == clientv3.EventTypePut {
 				var task models.TaskV3
 				if err := json.Unmarshal(event.Kv.Value, &task); err == nil {
-					if task.Status == models.TaskStatusApproved {
+					// Only configure PXE if task is approved and PXE not yet configured
+					if task.Status == models.TaskStatusApproved && !task.PXEConfigured {
 						log.Printf("[%s] Task approved for %s, configuring PXE boot...", rc.idc, task.SN)
 						// Configure PXE boot environment
 						go rc.configurePXEBoot(&task)
@@ -634,8 +930,8 @@ func (rc *RegionalClient) handleHardwareReport(c *gin.Context) {
 	})
 
 	if err != nil {
-		// Store as unmatched report
-		unmatchedKey := fmt.Sprintf("/os/unmatched_reports/%s/%d-%s", rc.idc, time.Now().Unix(), req.MAC)
+		// Store as unmatched report (without timestamp in key)
+		unmatchedKey := fmt.Sprintf("/os/unmatched_reports/%s/%s", rc.idc, req.MAC)
 		rc.etcdClient.Put(unmatchedKey, req)
 
 		log.Printf("[%s] Hardware report unmatched (stored): %s", rc.idc, req.MAC)
@@ -749,18 +1045,26 @@ func (rc *RegionalClient) isInInstallQueue(c *gin.Context) {
 		SN string `json:"sn" binding:"required"`
 	}
 	if err := c.BindJSON(&req); err != nil {
+		log.Printf("[%s] isInInstallQueue: Failed to bind JSON: %v", rc.idc, err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
+	log.Printf("[%s] isInInstallQueue: Checking queue for SN=%s", rc.idc, req.SN)
+
 	// Check if task exists and is approved
 	taskKey := etcd.TaskKeyV3(rc.idc, req.SN)
+	log.Printf("[%s] isInInstallQueue: Task key=%s", rc.idc, taskKey)
+
 	var task models.TaskV3
 	if err := rc.etcdClient.GetJSON(taskKey, &task); err != nil {
 		// No task found - not in queue yet
+		log.Printf("[%s] isInInstallQueue: Failed to get task from etcd: %v", rc.idc, err)
 		c.JSON(http.StatusOK, gin.H{"result": false})
 		return
 	}
+
+	log.Printf("[%s] isInInstallQueue: Task found, status=%s", rc.idc, task.Status)
 
 	// Check if task is approved (approved or later stages mean it's in queue)
 	inQueue := task.Status == models.TaskStatusApproved ||
@@ -803,22 +1107,65 @@ func (rc *RegionalClient) getNextOperation(c *gin.Context) {
 	case models.TaskStatusInstalling:
 		// Check progress to determine next step
 		lastProgress := 0
+		lastStep := ""
 		if len(task.Progress) > 0 {
 			lastProgress = task.Progress[len(task.Progress)-1].Percent
+			lastStep = task.Progress[len(task.Progress)-1].Step
 		}
 
-		if lastProgress < 40 {
+		if lastProgress < 40 || lastStep == "" {
 			operation = "hardware_config"
+			data = gin.H{"message": "Configure hardware settings"}
 		} else if lastProgress < 50 {
 			operation = "network_config"
+			data = gin.H{"message": "Configure network settings"}
 		} else if lastProgress < 100 {
 			operation = "os_install"
-			data = gin.H{
-				"os_type":    task.OSType,
-				"os_version": task.OSVersion,
+
+			// 决定安装方式并返回完整配置
+			installMethod := rc.determineInstallMethod(&task)
+
+			config := &models.OSInstallConfig{
+				Method:    installMethod,
+				OSType:    task.OSType,
+				OSVersion: task.OSVersion,
+				MirrorURL: fmt.Sprintf("http://%s:8081", rc.serverIP),
+				Network: models.NetworkConfig{
+					Interface: "eth0",
+					Method:    "static",
+					IP:        task.IP,
+					Netmask:   "255.255.255.0",
+					Gateway:   rc.serverIP,
+					DNS:       rc.serverIP,
+					Hostname:  task.Hostname,
+				},
 			}
+
+			if installMethod == models.InstallMethodKickstart {
+				config.KickstartURL = fmt.Sprintf("http://%s:8081/api/v1/kickstart/%s", rc.serverIP, req.SN)
+			} else {
+				config.DiskLayout = models.DiskLayoutConfig{
+					RootDisk:       "/dev/sda",
+					PartitionTable: "gpt",
+					Partitions: []models.PartitionConfig{
+						{MountPoint: "/boot", Size: "1G", FSType: "ext4"},
+						{MountPoint: "swap", Size: "16G", FSType: "swap"},
+						{MountPoint: "/", Size: "0", FSType: "ext4"},
+					},
+				}
+				config.Packages = []string{
+					"openssh-server",
+					"wget",
+					"curl",
+					"vim",
+					"net-tools",
+				}
+			}
+
+			data = config
 		} else {
 			operation = "reboot"
+			data = gin.H{"message": "Reboot to new system"}
 		}
 
 	case models.TaskStatusCompleted:
@@ -928,4 +1275,273 @@ func (rc *RegionalClient) operationComplete(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Operation status updated"})
+}
+
+// ========== OS Installation Handlers ==========
+
+// determineInstallMethod determines the installation method based on task configuration
+func (rc *RegionalClient) determineInstallMethod(task *models.TaskV3) models.InstallMethod {
+	// 场景 1: 如果任务指定了特殊的磁盘布局或软件包，使用 Agent 直接安装
+	if task.DiskLayout != "" || task.NetworkConf != "" {
+		return models.InstallMethodAgentDirect
+	}
+	
+	// 场景 2: Ubuntu 使用 Agent 直接安装（debootstrap）
+	if task.OSType == "ubuntu" || task.OSType == "debian" {
+		return models.InstallMethodAgentDirect
+	}
+	
+	// 场景 3: CentOS/Rocky 使用 Kickstart（更成熟）
+	if task.OSType == "centos" || task.OSType == "rocky" {
+		return models.InstallMethodKickstart
+	}
+	
+	// 默认使用 Agent 直接安装（更灵活）
+	return models.InstallMethodAgentDirect
+}
+
+// getOSInstallConfig returns OS installation configuration
+func (rc *RegionalClient) getOSInstallConfig(c *gin.Context) {
+	var req struct {
+		SN string `json:"sn" binding:"required"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	taskKey := etcd.TaskKeyV3(rc.idc, req.SN)
+	var task models.TaskV3
+	if err := rc.etcdClient.GetJSON(taskKey, &task); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Task not found"})
+		return
+	}
+
+	// 决定安装方式
+	installMethod := rc.determineInstallMethod(&task)
+
+	// 构建安装配置
+	config := &models.OSInstallConfig{
+		Method:    installMethod,
+		OSType:    task.OSType,
+		OSVersion: task.OSVersion,
+		MirrorURL: fmt.Sprintf("http://%s:8081", rc.serverIP),
+		Network: models.NetworkConfig{
+			Interface: "eth0",
+			Method:    "static",
+			IP:        task.IP,
+			Netmask:   "255.255.255.0",
+			Gateway:   rc.serverIP,
+			DNS:       rc.serverIP,
+			Hostname:  task.Hostname,
+		},
+	}
+
+	// 根据安装方式配置不同的参数
+	if installMethod == models.InstallMethodKickstart {
+		// Kickstart 方式：提供 kickstart URL
+		config.KickstartURL = fmt.Sprintf("http://%s:8081/api/v1/kickstart/%s", rc.serverIP, req.SN)
+	} else {
+		// Agent 直接安装方式：提供详细的安装参数
+		config.DiskLayout = models.DiskLayoutConfig{
+			RootDisk:       "/dev/sda",
+			PartitionTable: "gpt",
+			Partitions: []models.PartitionConfig{
+				{MountPoint: "/boot", Size: "1G", FSType: "ext4"},
+				{MountPoint: "swap", Size: "16G", FSType: "swap"},
+				{MountPoint: "/", Size: "0", FSType: "ext4"}, // 0 表示使用剩余空间
+			},
+		}
+
+		// 默认软件包
+		config.Packages = []string{
+			"openssh-server",
+			"wget",
+			"curl",
+			"vim",
+			"net-tools",
+		}
+
+		// 如果需要 post-install 脚本
+		// config.PostScript = base64.StdEncoding.EncodeToString([]byte("#!/bin/bash\necho 'Post install complete'\n"))
+	}
+
+	log.Printf("[%s] getOSInstallConfig for %s: method=%s", rc.idc, req.SN, installMethod)
+	c.JSON(http.StatusOK, config)
+}
+
+// generateKickstart generates kickstart file for a server
+func (rc *RegionalClient) generateKickstart(c *gin.Context) {
+	sn := c.Param("sn")
+
+	taskKey := etcd.TaskKeyV3(rc.idc, sn)
+	var task models.TaskV3
+	if err := rc.etcdClient.GetJSON(taskKey, &task); err != nil {
+		c.String(http.StatusNotFound, "Task not found for SN: %s", sn)
+		return
+	}
+
+	// 构建安装配置
+	config := &models.OSInstallConfig{
+		Method:      models.InstallMethodKickstart,
+		OSType:      task.OSType,
+		OSVersion:   task.OSVersion,
+		MirrorURL:   fmt.Sprintf("http://%s:8081/repos/%s/%s", rc.serverIP, task.OSType, task.OSVersion),
+		RegionalURL: fmt.Sprintf("http://%s:8081", rc.serverIP),
+		Network: models.NetworkConfig{
+			Interface: "eth0",
+			Method:    "static",
+			IP:        task.IP,
+			Netmask:   "255.255.255.0",
+			Gateway:   rc.serverIP,
+			DNS:       rc.serverIP,
+			Hostname:  task.Hostname,
+		},
+		DiskLayout: models.DiskLayoutConfig{
+			RootDisk:       "/dev/sda",
+			PartitionTable: "gpt",
+			Partitions: []models.PartitionConfig{
+				{MountPoint: "/boot", Size: "1G", FSType: "ext4"},
+				{MountPoint: "swap", Size: "16G", FSType: "swap"},
+				{MountPoint: "/", Size: "0", FSType: "ext4"},
+			},
+		},
+		RootPassword: "$6$rounds=656000$YourSaltHere$HashedPasswordHere", // 应该从配置读取
+		Packages: []string{
+			"wget",
+			"curl",
+			"vim",
+			"net-tools",
+		},
+	}
+
+	// 生成 kickstart 内容
+	ksContent, err := rc.kickstartGenerator.Generate(&task, config)
+	if err != nil {
+		log.Printf("[%s] Failed to generate kickstart for %s: %v", rc.idc, sn, err)
+		c.String(http.StatusInternalServerError, "Failed to generate kickstart: %v", err)
+		return
+	}
+
+	log.Printf("[%s] Generated kickstart for %s", rc.idc, sn)
+	c.Header("Content-Type", "text/plain; charset=utf-8")
+	c.String(http.StatusOK, ksContent)
+}
+
+// generatePreseed generates preseed file for Ubuntu/Debian
+func (rc *RegionalClient) generatePreseed(c *gin.Context) {
+	sn := c.Param("sn")
+
+	taskKey := etcd.TaskKeyV3(rc.idc, sn)
+	var task models.TaskV3
+	if err := rc.etcdClient.GetJSON(taskKey, &task); err != nil {
+		c.String(http.StatusNotFound, "Task not found for SN: %s", sn)
+		return
+	}
+
+	// 构建安装配置
+	config := &models.OSInstallConfig{
+		Method:    models.InstallMethodKickstart,
+		OSType:    task.OSType,
+		OSVersion: task.OSVersion,
+		MirrorURL: fmt.Sprintf("http://%s:8081/repos/%s/%s", rc.serverIP, task.OSType, task.OSVersion),
+		Network: models.NetworkConfig{
+			Interface: "eth0",
+			Method:    "static",
+			IP:        task.IP,
+			Netmask:   "255.255.255.0",
+			Gateway:   rc.serverIP,
+			DNS:       rc.serverIP,
+			Hostname:  task.Hostname,
+		},
+		DiskLayout: models.DiskLayoutConfig{
+			RootDisk:       "/dev/sda",
+			PartitionTable: "gpt",
+			Partitions: []models.PartitionConfig{
+				{MountPoint: "/boot", Size: "1G", FSType: "ext4"},
+				{MountPoint: "swap", Size: "16G", FSType: "swap"},
+				{MountPoint: "/", Size: "0", FSType: "ext4"},
+			},
+		},
+		RootPassword: "$6$rounds=656000$YourSaltHere$HashedPasswordHere",
+	}
+
+	// 生成 preseed 内容
+	preseedContent, err := rc.kickstartGenerator.GeneratePreseed(&task, config)
+	if err != nil {
+		log.Printf("[%s] Failed to generate preseed for %s: %v", rc.idc, sn, err)
+		c.String(http.StatusInternalServerError, "Failed to generate preseed: %v", err)
+		return
+	}
+
+	log.Printf("[%s] Generated preseed for %s", rc.idc, sn)
+	c.Header("Content-Type", "text/plain; charset=utf-8")
+	c.String(http.StatusOK, preseedContent)
+}
+
+// installComplete handles installation completion notification
+func (rc *RegionalClient) installComplete(c *gin.Context) {
+	var req struct {
+		SN      string `json:"sn" binding:"required"`
+		Status  string `json:"status" binding:"required"`
+		Message string `json:"message"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	log.Printf("[%s] Installation complete notification from %s: status=%s, message=%s",
+		rc.idc, req.SN, req.Status, req.Message)
+
+	taskKey := etcd.TaskKeyV3(rc.idc, req.SN)
+	err := rc.etcdClient.AtomicUpdate(taskKey, func(data []byte) (interface{}, error) {
+		var task models.TaskV3
+		if err := json.Unmarshal(data, &task); err != nil {
+			return nil, err
+		}
+
+		// 更新任务状态
+		if req.Status == "success" {
+			task.Status = models.TaskStatusCompleted
+			task.StatusHistory = append(task.StatusHistory, models.StatusChange{
+				Status:    models.TaskStatusCompleted,
+				Timestamp: time.Now(),
+				Reason:    "OS installation completed successfully",
+			})
+		} else {
+			task.Status = models.TaskStatusFailed
+			task.StatusHistory = append(task.StatusHistory, models.StatusChange{
+				Status:    models.TaskStatusFailed,
+				Timestamp: time.Now(),
+				Reason:    fmt.Sprintf("OS installation failed: %s", req.Message),
+			})
+		}
+
+		task.Progress = append(task.Progress, models.ProgressStep{
+			Step:      "os_install",
+			Percent:   100,
+			Timestamp: time.Now(),
+			Message:   req.Message,
+		})
+
+		task.Logs = append(task.Logs, fmt.Sprintf("[INFO] Installation %s: %s", req.Status, req.Message))
+		task.UpdatedAt = time.Now()
+
+		return task, nil
+	})
+
+	if err != nil {
+		log.Printf("[%s] Failed to update task status: %v", rc.idc, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update task"})
+		return
+	}
+
+	// 清理 PXE 配置
+	var task models.TaskV3
+	if err := rc.etcdClient.GetJSON(taskKey, &task); err == nil {
+		go rc.cleanupPXEBoot(&task)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Installation status updated"})
 }

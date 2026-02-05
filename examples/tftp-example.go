@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yourusername/lpmos-go/cmd/regional-client/tftp"
+	"github.com/lpmos/lpmos-go/cmd/regional-client/tftp"
 )
 
 func main() {
@@ -72,11 +72,11 @@ For PXE boot, place your kernel and initrd files in the respective directories.
 
 	// 4. 创建 TFTP 服务器配置
 	config := tftp.Config{
-		RootDir:    tftpRoot,            // TFTP 根目录
-		ListenAddr: ":69",               // 监听地址 (标准 TFTP 端口)
-		MaxClients: 100,                 // 最大并发客户端数
-		Timeout:    30 * time.Second,    // 传输超时时间
-		BlockSize:  512,                 // 块大小 (标准 TFTP 块大小)
+		RootDir:    tftpRoot,         // TFTP 根目录
+		ListenAddr: ":69",            // 监听地址 (标准 TFTP 端口)
+		MaxClients: 100,              // 最大并发客户端数
+		Timeout:    30 * time.Second, // 传输超时时间
+		BlockSize:  512,              // 块大小 (标准 TFTP 块大小)
 	}
 
 	// 5. 创建 TFTP 服务器
